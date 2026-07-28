@@ -3,13 +3,13 @@ version: "3.9"
 services:
   backend:
     build:
-      context: ./backend
+      context: ../backend
       dockerfile: Dockerfile
     container_name: tbx-backend
     ports:
       - "8000:8000"
     env_file:
-      - ./backend/.env
+      - ../backend/.env
     environment:
       - DATABASE_URL=postgresql+asyncpg://tbx:tbx@postgres:5432/tbx
       - DATABASE_URL_SYNC=postgresql://tbx:tbx@postgres:5432/tbx
@@ -21,7 +21,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     volumes:
-      - ./backend:/app
+      - ../backend:/app
 
   postgres:
     image: postgres:16-alpine

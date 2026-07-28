@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -18,9 +19,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tbx")
 
+_collector_task = None
+_signal_task = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _collector_task, _signal_task
     logger.info("TBX Trade Terminal starting...")
 
     await init_redis()
@@ -30,7 +35,20 @@ async def lifespan(app: FastAPI):
         await start_bot()
         logger.info("Telegram bot integrated")
 
+    try:
+        from app.services.market_data.collector import start_collector, start_signal_engine
+        _collector_task = await start_collector()
+        _signal_task = await start_signal_engine()
+        logger.info("Market data collector & signal engine started")
+    except Exception as e:
+        logger.warning("Market data collector not started: %s", e)
+
     yield
+
+    if _collector_task:
+        _collector_task.cancel()
+    if _signal_task:
+        _signal_task.cancel()
 
     if settings.TELEGRAM_TOKEN:
         await stop_bot()

@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import decode_token
 from app.models.user import User
+from app.models.subscription import Subscription, SubscriptionStatus
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
@@ -70,3 +71,30 @@ async def get_current_admin(current_user: CurrentUser) -> User:
 
 
 CurrentAdmin = Annotated[User, Depends(get_current_admin)]
+
+
+async def require_active_subscription(
+    current_user: CurrentUser,
+    db: DbSession,
+) -> User:
+    if current_user.referred_by:
+        return current_user
+
+    result = await db.execute(
+        select(Subscription).where(
+            Subscription.user_id == current_user.id,
+            Subscription.status.in_([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL]),
+        )
+    )
+    sub = result.scalar_one_or_none()
+
+    if sub:
+        return current_user
+
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail="Active subscription required. Subscribe or register via Bybit referral for free access.",
+    )
+
+
+ActiveSubscriber = Annotated[User, Depends(require_active_subscription)]

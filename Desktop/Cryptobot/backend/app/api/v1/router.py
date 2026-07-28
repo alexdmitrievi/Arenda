@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import admin, analytics, auth, payments, portfolio, prop_firm, users
+from app.api.v1 import admin, analytics, auth, payments, portfolio, prop_firm, signals, users
 
 api_router = APIRouter()
 
@@ -11,3 +11,4 @@ api_router.include_router(portfolio.router, prefix="/portfolios", tags=["portfol
 api_router.include_router(prop_firm.router, prefix="/prop-firm", tags=["prop-firm"])
 api_router.include_router(analytics.router, prefix="/analytics", tags=["analytics"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
+api_router.include_router(signals.router, prefix="/trading", tags=["trading"])

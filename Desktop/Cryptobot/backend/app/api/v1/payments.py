@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -12,6 +14,7 @@ from app.models.subscription import (
     Invoice,
     Payment,
     PaymentStatus,
+    PLAN_PRICES,
     Subscription,
     SubscriptionPlan,
     SubscriptionStatus,
@@ -397,3 +400,95 @@ async def get_payment_history(
         }
         for p in payments
     ]
+
+
+@router.post("/webhook/cryptocloud")
+async def cryptocloud_webhook(
+    request: Request,
+    db: DbSession,
+):
+    body = await request.body()
+    signature_hdr = (request.headers.get("X-Signature-SHA256") or "").strip().lower()
+
+    import os
+    api_secret = os.getenv("CRYPTOCLOUD_API_SECRET", "")
+    if not api_secret:
+        logger.warning("CryptoCloud API secret not configured")
+        return {"status": "not configured"}
+
+    calc_sig = hmac.new(api_secret.encode(), body, hashlib.sha256).hexdigest().lower()
+    if not hmac.compare_digest(signature_hdr, calc_sig):
+        logger.warning("CryptoCloud: invalid signature")
+        return {"status": "invalid signature"}
+
+    try:
+        data = await request.json()
+    except Exception:
+        return {"status": "bad payload"}
+
+    payment_status = str(data.get("status") or "").lower()
+    if payment_status != "paid":
+        return {"status": "ignored"}
+
+    order_id = (data.get("order_id") or "").strip()
+    if not order_id:
+        return {"status": "missing order_id"}
+
+    amount_received = Decimal(str(data.get("amount", 0)))
+    currency = str(data.get("currency", "USDT"))
+
+    try:
+        parts = order_id.split(":")
+        user_id = UUID(parts[0])
+        plan_str = parts[1] if len(parts) > 1 else "trader"
+    except (ValueError, IndexError):
+        logger.error("CryptoCloud: bad order_id %s", order_id)
+        return {"status": "bad order_id"}
+
+    plan = SubscriptionPlan(plan_str) if plan_str in SubscriptionPlan.__members__ else SubscriptionPlan.TRADER
+    expected_amount = PLAN_PRICES.get(plan, Decimal("29"))
+
+    if abs(amount_received - expected_amount) > Decimal("0.01"):
+        logger.warning("CryptoCloud: amount mismatch %s vs %s", amount_received, expected_amount)
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        logger.error("CryptoCloud: user not found %s", user_id)
+        return {"status": "user not found"}
+
+    now = datetime.now(timezone.utc)
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.user_id == user_id)
+    )
+    subscription = sub_result.scalar_one_or_none()
+
+    if subscription:
+        subscription.plan = plan
+        subscription.status = SubscriptionStatus.ACTIVE
+        subscription.expires_at = now + timedelta(days=30)
+        subscription.started_at = subscription.started_at or now
+    else:
+        subscription = Subscription(
+            user_id=user_id,
+            plan=plan,
+            status=SubscriptionStatus.ACTIVE,
+            started_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+        db.add(subscription)
+
+    payment = Payment(
+        user_id=user_id,
+        subscription_id=subscription.id,
+        amount=amount_received,
+        currency=currency,
+        status=PaymentStatus.SUCCEEDED,
+        plan=plan,
+        description=f"CryptoCloud payment: {plan.value}",
+    )
+    db.add(payment)
+    await db.commit()
+
+    logger.info("CryptoCloud: subscription activated for %s plan=%s", user_id, plan.value)
+    return {"status": "activated", "user_id": str(user_id), "plan": plan.value}

@@ -35,9 +35,9 @@ class PaymentStatus(StrEnum):
 
 PLAN_PRICES: dict[SubscriptionPlan, Decimal] = {
     SubscriptionPlan.DEMO: Decimal("0"),
-    SubscriptionPlan.TRADER: Decimal("4900.00"),
-    SubscriptionPlan.INVESTOR_PRO: Decimal("9900.00"),
-    SubscriptionPlan.PROP_FIRM_MASTER: Decimal("14900.00"),
+    SubscriptionPlan.TRADER: Decimal("29.00"),
+    SubscriptionPlan.INVESTOR_PRO: Decimal("79.00"),
+    SubscriptionPlan.PROP_FIRM_MASTER: Decimal("149.00"),
     SubscriptionPlan.ENTERPRISE: Decimal("0"),
 }
 

@@ -19,6 +19,7 @@ from app.bot.handlers.glossary import handle_glossary
 from app.bot.handlers.payments import handle_buy, handle_trial_start, handle_free_access, handle_uid_submission
 from app.bot.handlers.admin import admin_grant, admin_stats, admin_broadcast, admin_reload
 from app.bot.handlers.prop_firm import handle_prop_firm_menu
+from app.bot.handlers.signals import signals_command, latest_signal_command
 
 logger = logging.getLogger("tbx.bot")
 
@@ -41,6 +42,9 @@ async def build_bot():
     _application.add_handler(CommandHandler("stats", admin_stats))
     _application.add_handler(CommandHandler("broadcast", admin_broadcast))
     _application.add_handler(CommandHandler("reload", admin_reload))
+
+    _application.add_handler(CommandHandler("signals", signals_command))
+    _application.add_handler(CommandHandler("signal", latest_signal_command))
 
     _application.add_handler(risk_calc_handler)
 
