@@ -143,3 +143,71 @@ class TestSMCStrategy:
         assert result.total_trades >= 0
         assert 0 <= result.win_rate <= 100
         assert result.max_drawdown_pct >= 0
+
+
+class TestSignalGeometry:
+    """Directional invariants: SL and every TP must sit on the correct side of entry."""
+
+    def _fib(self, high: float, low: float) -> dict:
+        return FibonacciCalculator.retracement(high, low)
+
+    def test_buy_targets_above_entry(self):
+        gen = SignalGenerator()
+        entry, stop = 100.0, 95.0
+        tps = gen._find_targets(entry, stop, "BUY")
+        assert all(tp > entry for tp in tps)
+        assert tps == sorted(tps)
+
+    def test_sell_targets_below_entry(self):
+        gen = SignalGenerator()
+        entry, stop = 100.0, 105.0
+        tps = gen._find_targets(entry, stop, "SELL")
+        assert all(tp < entry for tp in tps)
+        assert tps == sorted(tps, reverse=True)
+
+    def test_targets_scale_with_risk(self):
+        gen = SignalGenerator()
+        tps = gen._find_targets(100.0, 98.0, "BUY")
+        assert tps == [106.0, 110.0, 114.0]
+        tps = gen._find_targets(100.0, 102.0, "SELL")
+        assert tps == [94.0, 90.0, 86.0]
+
+    def test_zero_risk_does_not_crash(self):
+        gen = SignalGenerator()
+        tps = gen._find_targets(100.0, 100.0, "BUY")
+        assert len(tps) == 3
+        assert all(tp > 100.0 for tp in tps)
+
+    def test_buy_entry_in_discount(self):
+        gen = SignalGenerator()
+        fib = self._fib(high=110.0, low=100.0)
+        entry = gen._find_entry(105.0, fib, "BUY")
+        assert entry < (110.0 + 100.0) / 2
+
+    def test_sell_entry_in_premium(self):
+        gen = SignalGenerator()
+        fib = self._fib(high=110.0, low=100.0)
+        entry = gen._find_entry(105.0, fib, "SELL")
+        assert entry > (110.0 + 100.0) / 2
+
+    def test_generated_sell_signal_geometry(self):
+        """End-to-end: any SELL signal must have TP < entry < SL."""
+        np.random.seed(7)
+        strategy = SMCStrategy(min_rr_ratio=1.0, min_confidence=40)
+        for seed in range(20):
+            np.random.seed(seed)
+            df = make_trending_down(250)
+            signal = strategy.generate_signal(df, "TEST")
+            if signal.direction == "SELL":
+                assert signal.stop_loss > signal.entry
+                assert all(tp < signal.entry for tp in signal.take_profit)
+
+    def test_generated_buy_signal_geometry(self):
+        """End-to-end: any BUY signal must have SL < entry < TP."""
+        for seed in range(20):
+            np.random.seed(seed)
+            df = make_trending_up(250)
+            signal = SMCStrategy(min_rr_ratio=1.0, min_confidence=40).generate_signal(df, "TEST")
+            if signal.direction == "BUY":
+                assert signal.stop_loss < signal.entry
+                assert all(tp > signal.entry for tp in signal.take_profit)

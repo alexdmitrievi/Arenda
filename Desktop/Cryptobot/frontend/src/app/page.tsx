@@ -7,6 +7,7 @@ import {
   fetchTrades,
   executeSignal,
   closePosition,
+  createSignalStream,
   getToken,
   setToken,
   Signal,
@@ -31,8 +32,17 @@ export default function Dashboard() {
       return;
     }
     loadData();
-    const interval = setInterval(loadData, 30000);
-    return () => clearInterval(interval);
+    // SSE delivers new signals instantly; polling stays as a slow fallback
+    const stream = createSignalStream((signal) => {
+      setSignals((prev) =>
+        prev.some((s) => s.id === signal.id) ? prev : [signal, ...prev]
+      );
+    });
+    const interval = setInterval(loadData, 120000);
+    return () => {
+      clearInterval(interval);
+      stream?.close();
+    };
   }, []);
 
   async function loadData() {

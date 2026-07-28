@@ -64,14 +64,16 @@ async def set_exchange_keys(
     data: ExchangeKeySet,
     current_user: CurrentUser,
 ):
-    current_keys = current_user.exchange_keys_encrypted or {}
+    current_keys = dict(current_user.exchange_keys_encrypted or {})
 
-    key_data = {
+    key_data: dict = {
         "api_key": encrypt_api_key(data.api_key),
         "secret": encrypt_api_key(data.secret),
     }
     if data.passphrase:
         key_data["passphrase"] = encrypt_api_key(data.passphrase)
+    if data.risk_per_trade_pct is not None:
+        key_data["risk_per_trade_pct"] = data.risk_per_trade_pct
 
     current_keys[data.exchange.lower()] = key_data
     current_user.exchange_keys_encrypted = current_keys
@@ -104,7 +106,7 @@ async def delete_exchange_keys(
     exchange: str,
     current_user: CurrentUser,
 ):
-    current_keys = current_user.exchange_keys_encrypted or {}
+    current_keys = dict(current_user.exchange_keys_encrypted or {})
     ex = exchange.lower()
 
     if ex not in current_keys:

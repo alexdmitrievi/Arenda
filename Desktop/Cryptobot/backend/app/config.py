@@ -35,6 +35,7 @@ class Settings(BaseSettings):
 
     YOOKASSA_SHOP_ID: str = ""
     YOOKASSA_SECRET_KEY: str = ""
+    YOOKASSA_ENABLED: bool = False
 
     ENCRYPTION_KEY: str = ""
 

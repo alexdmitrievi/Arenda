@@ -300,24 +300,26 @@ class SignalGenerator:
         if buy_confidence >= self.min_confidence and buy_confidence > sell_confidence:
             entry = self._find_entry(current_price, fib, "BUY")
             sl = self._find_stop(recent_swing_lows, entry, "BUY")
-            tp = self._find_targets(entry, sl)
-            return SignalResult(
-                symbol=symbol, direction="BUY",
-                entry=entry, stop_loss=sl, take_profit=tp,
-                confidence=buy_confidence,
-                metadata={"trend": trend, "fib_ote": FibonacciCalculator.ote_zone(fib)},
-            )
+            if sl < entry:
+                tp = self._find_targets(entry, sl, "BUY")
+                return SignalResult(
+                    symbol=symbol, direction="BUY",
+                    entry=entry, stop_loss=sl, take_profit=tp,
+                    confidence=buy_confidence,
+                    metadata={"trend": trend, "fib_ote": FibonacciCalculator.ote_zone(fib)},
+                )
 
         if sell_confidence >= self.min_confidence and sell_confidence > buy_confidence:
             entry = self._find_entry(current_price, fib, "SELL")
             sl = self._find_stop(recent_swing_highs, entry, "SELL")
-            tp = self._find_targets(entry, sl)
-            return SignalResult(
-                symbol=symbol, direction="SELL",
-                entry=entry, stop_loss=sl, take_profit=tp,
-                confidence=sell_confidence,
-                metadata={"trend": trend, "fib_ote": FibonacciCalculator.ote_zone(fib)},
-            )
+            if sl > entry:
+                tp = self._find_targets(entry, sl, "SELL")
+                return SignalResult(
+                    symbol=symbol, direction="SELL",
+                    entry=entry, stop_loss=sl, take_profit=tp,
+                    confidence=sell_confidence,
+                    metadata={"trend": trend, "fib_ote": FibonacciCalculator.ote_zone(fib)},
+                )
 
         return SignalResult(symbol=symbol, direction="NONE", entry=None, stop_loss=None,
                             take_profit=[], confidence=max(buy_confidence, sell_confidence),
@@ -429,11 +431,19 @@ class SignalGenerator:
 
         return max(0, min(100, confidence))
 
+    OTE_MID = 0.702  # midpoint of the 0.618–0.786 OTE retracement zone
+
     def _find_entry(self, price: float, fib: dict, direction: str) -> float:
-        ote = FibonacciCalculator.ote_zone(fib)
-        if ote["low"] and ote["high"]:
-            return round((ote["low"] + ote["high"]) / 2, 4)
-        return round(fib.get(0.618, price), 4)
+        high = fib.get(0.0)
+        low = fib.get(1.0)
+        if not high or not low or high <= low:
+            return round(price, 4)
+        diff = high - low
+        if direction == "BUY":
+            # discount: retracement of the up-leg into the OTE zone
+            return round(high - diff * self.OTE_MID, 4)
+        # premium: mirror of the OTE zone for shorts
+        return round(low + diff * self.OTE_MID, 4)
 
     def _find_stop(self, swing_points: list, entry: float, direction: str) -> float:
         if direction == "BUY":
@@ -443,20 +453,19 @@ class SignalGenerator:
             prices = [s.price for s in swing_points] if swing_points else [entry * 1.03]
             return round(max(prices) * 1.002, 4)
 
-    def _find_targets(self, entry: float, stop: float) -> list[float]:
-        if entry == stop:
-            return [round(entry * 1.05, 4)]
-        risk = abs(entry - stop)
+    def _find_targets(self, entry: float, stop: float, direction: str) -> list[float]:
+        risk = abs(entry - stop) or entry * 0.01
+        sign = 1 if direction == "BUY" else -1
         return [
-            round(entry + risk * 3, 4),
-            round(entry + risk * 5, 4),
-            round(entry + risk * 7, 4),
+            round(entry + sign * risk * 3, 4),
+            round(entry + sign * risk * 5, 4),
+            round(entry + sign * risk * 7, 4),
         ]
 
 
 class SMCStrategy(AbstractStrategy):
     name = "SMC"
-    timeframe = "4h"
+    timeframe = "1h"  # must match the collector's TIMEFRAME
 
     def __init__(self, min_rr_ratio: float = 3.0, min_confidence: int = 50):
         self.generator = SignalGenerator(min_rr_ratio=min_rr_ratio, min_confidence=min_confidence)
@@ -475,7 +484,7 @@ class SMCStrategy(AbstractStrategy):
         signal = self.generator.generate(df, swings, bos_events, fvgs, obs, liquidity, symbol)
 
         logger.info(
-            "SMC signal: %s %s entry=%.4f sl=%.4f tp=%s conf=%d",
+            "SMC signal: %s %s entry=%s sl=%s tp=%s conf=%d",
             signal.symbol, signal.direction, signal.entry,
             signal.stop_loss, signal.take_profit, signal.confidence,
         )

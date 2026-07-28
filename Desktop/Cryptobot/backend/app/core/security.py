@@ -1,5 +1,3 @@
-import base64
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -9,13 +7,34 @@ from jose import JWTError, jwt
 
 from app.config import settings
 
+_KEYGEN_HINT = (
+    'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
+)
+
+_fernet: Fernet | None = None
+
 
 def _get_fernet() -> Fernet:
-    key = settings.ENCRYPTION_KEY.encode() if settings.ENCRYPTION_KEY else base64.urlsafe_b64encode(os.urandom(32))
-    return Fernet(key)
+    global _fernet
+    if _fernet is None:
+        if not settings.ENCRYPTION_KEY:
+            raise RuntimeError(
+                "ENCRYPTION_KEY is not set. Without a stable key, exchange API keys "
+                f"become unreadable after every restart. Generate one with: {_KEYGEN_HINT} "
+                "and put it in .env as ENCRYPTION_KEY=<key>."
+            )
+        _fernet = Fernet(settings.ENCRYPTION_KEY.encode())
+    return _fernet
 
 
-_fernet = _get_fernet()
+def validate_crypto_config() -> None:
+    """Fail fast at startup on misconfigured secrets instead of corrupting data later."""
+    _get_fernet()
+    if settings.SECRET_KEY == "change-me-in-production-use-openssl-rand-hex-32":
+        raise RuntimeError(
+            "SECRET_KEY is still the default value — JWT tokens can be forged. "
+            'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
+        )
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -47,8 +66,8 @@ def decode_token(token: str) -> dict[str, Any]:
 
 
 def encrypt_api_key(plaintext: str) -> str:
-    return _fernet.encrypt(plaintext.encode()).decode()
+    return _get_fernet().encrypt(plaintext.encode()).decode()
 
 
 def decrypt_api_key(ciphertext: str) -> str:
-    return _fernet.decrypt(ciphertext.encode()).decode()
+    return _get_fernet().decrypt(ciphertext.encode()).decode()

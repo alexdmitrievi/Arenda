@@ -10,7 +10,13 @@ from decimal import Decimal
 import httpx
 
 from app.config import settings
-from app.models.subscription import PLAN_PRICES, PaymentStatus, SubscriptionPlan, SubscriptionStatus
+from app.models.subscription import (
+    PLAN_PRICES_RUB,
+    PLAN_PRICES_USD,
+    PaymentStatus,
+    SubscriptionPlan,
+    SubscriptionStatus,
+)
 
 logger = logging.getLogger("tbx.payments.yookassa")
 
@@ -190,5 +196,7 @@ def verify_webhook_signature(body: bytes, signature_header: str) -> bool:
     return False
 
 
-def get_plan_price(plan: SubscriptionPlan) -> Decimal:
-    return PLAN_PRICES.get(plan, Decimal("0"))
+def get_plan_price(plan: SubscriptionPlan, currency: str = "RUB") -> Decimal:
+    """YooKassa charges in RUB; CryptoCloud (USDT) uses the USD price list."""
+    prices = PLAN_PRICES_RUB if currency.upper() == "RUB" else PLAN_PRICES_USD
+    return prices.get(plan, Decimal("0"))
