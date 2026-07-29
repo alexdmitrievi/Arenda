@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 
 from app.api.deps import ActiveSubscriber, CurrentUser, DbSession, has_active_subscription
 from app.core.database import async_session_factory
@@ -22,6 +22,46 @@ router = APIRouter()
 
 # Free accounts see signals with a delay; paid/referral accounts see them live.
 FREE_SIGNAL_DELAY = timedelta(hours=24)
+
+# Portfolio-level risk limits for REAL trades (paper is unlimited).
+# Crypto alts are heavily correlated — 5 concurrent positions at 2% risk each
+# already behave like one ~10% BTC-beta bet, so the cap is deliberately tight.
+MAX_OPEN_REAL_TRADES = 5
+DAILY_LOSS_LIMIT_PCT = 5.0
+
+
+async def _check_portfolio_risk(db, user_id, usdt_balance: float):
+    open_count = await db.scalar(
+        select(func.count())
+        .select_from(Trade)
+        .where(
+            Trade.user_id == user_id,
+            Trade.exchange != "paper",
+            Trade.status.in_([TradeStatus.PENDING, TradeStatus.OPEN]),
+        )
+    )
+    if (open_count or 0) >= MAX_OPEN_REAL_TRADES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Risk limit: max {MAX_OPEN_REAL_TRADES} open positions. "
+            "Close something before opening a new trade.",
+        )
+
+    day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    realized_today = await db.scalar(
+        select(func.coalesce(func.sum(Trade.pnl), 0)).where(
+            Trade.user_id == user_id,
+            Trade.exchange != "paper",
+            Trade.status == TradeStatus.CLOSED,
+            Trade.closed_at >= day_start,
+        )
+    )
+    if usdt_balance > 0 and float(realized_today or 0) <= -usdt_balance * DAILY_LOSS_LIMIT_PCT / 100:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Risk limit: daily loss exceeded {DAILY_LOSS_LIMIT_PCT}% of balance. "
+            "Trading is paused until tomorrow (UTC).",
+        )
 
 
 async def _signal_visibility_cutoff(user, db) -> datetime | None:
@@ -240,6 +280,8 @@ async def execute_signal_endpoint(
 
         balance_data = await exchange.fetch_balance()
         usdt_balance = float(balance_data.get("USDT", {}).get("free", 0))
+
+        await _check_portfolio_risk(db, current_user.id, usdt_balance)
 
         risk_amount = usdt_balance * (risk_pct / 100)
         position_size_base = round(risk_amount / stop_distance, 6)

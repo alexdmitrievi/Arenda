@@ -21,7 +21,12 @@ from app.services.trading.market_data import cache_ohlcv, set_latest_price
 
 logger = logging.getLogger("tbx.market_data.collector")
 
-TRADE_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+TRADE_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT",
+    "BNB/USDT", "ADA/USDT", "TRX/USDT", "TON/USDT", "LINK/USDT",
+    "AVAX/USDT", "SUI/USDT", "AAVE/USDT", "ENA/USDT", "ONDO/USDT",
+    "ZEC/USDT", "HYPE/USDT",
+]
 TIMEFRAME = "1h"
 HTF_TIMEFRAME = "4h"  # higher-timeframe bias for signal confirmation
 HTF_CANDLES = 200
@@ -35,8 +40,21 @@ _smc_strategy: Optional[SMCStrategy] = None
 def get_smc_strategy() -> SMCStrategy:
     global _smc_strategy
     if _smc_strategy is None:
-        _smc_strategy = SMCStrategy(min_rr_ratio=2.0, min_confidence=50)
+        # RR 3:1 mandate: market structure must offer at least 3R to the first
+        # target, matching the 3R/5R/7R take-profit ladder
+        _smc_strategy = SMCStrategy(min_rr_ratio=3.0, min_confidence=50)
     return _smc_strategy
+
+
+async def _validate_symbols(exchange: ccxt_pro.Exchange) -> list[str]:
+    """Not every configured pair is guaranteed to be listed on the exchange —
+    skip missing ones loudly instead of retry-looping on them forever."""
+    await exchange.load_markets()
+    valid = [s for s in TRADE_SYMBOLS if s in exchange.markets]
+    missing = [s for s in TRADE_SYMBOLS if s not in exchange.markets]
+    if missing:
+        logger.warning("Symbols not listed on %s, skipped: %s", exchange.id, ", ".join(missing))
+    return valid
 
 
 class CandleBuffer:
@@ -82,7 +100,7 @@ async def _get_or_create_smc_strategy(db: AsyncSession) -> Strategy:
         strategy = Strategy(
             name="SMC 1H Signals",
             type=StrategyType.SMC,
-            params={"min_rr_ratio": 2.0, "min_confidence": 50},
+            params={"min_rr_ratio": 3.0, "min_confidence": 50},
             is_active=True,
         )
         db.add(strategy)
@@ -183,14 +201,15 @@ async def notify_signal(signal: Signal):
 async def watch_tickers_loop():
     """Keeps latest prices in Redis for the UI and paper trading."""
     exchange = ccxt_pro.binance({"enableRateLimit": True})
-    logger.info("Ticker collector started for %d symbols", len(TRADE_SYMBOLS))
+    symbols = await _validate_symbols(exchange)
+    logger.info("Ticker collector started for %d symbols", len(symbols))
 
     retry_delay = 5
     try:
         while True:
             started = time.monotonic()
             try:
-                await _watch_tickers(exchange)
+                await _watch_tickers(exchange, symbols)
             except asyncio.CancelledError:
                 logger.info("Ticker collector cancelled")
                 break
@@ -204,9 +223,9 @@ async def watch_tickers_loop():
         await exchange.close()
 
 
-async def _watch_tickers(exchange: ccxt_pro.Exchange):
+async def _watch_tickers(exchange: ccxt_pro.Exchange, symbols: list[str]):
     while True:
-        tickers = await exchange.watch_tickers(TRADE_SYMBOLS)
+        tickers = await exchange.watch_tickers(symbols)
         redis = await get_redis()
         for symbol, ticker in tickers.items():
             if ticker and ticker.get("last"):
@@ -222,9 +241,10 @@ async def start_collector():
 
 async def watch_and_signal_loop():
     exchange = ccxt_pro.binance({"enableRateLimit": True})
-    logger.info("Signal Engine started. Symbols: %s", ", ".join(TRADE_SYMBOLS))
+    symbols = await _validate_symbols(exchange)
+    logger.info("Signal Engine started. Symbols: %s", ", ".join(symbols))
     try:
-        await asyncio.gather(*(_symbol_loop(exchange, s) for s in TRADE_SYMBOLS))
+        await asyncio.gather(*(_symbol_loop(exchange, s) for s in symbols))
     finally:
         await exchange.close()
 
