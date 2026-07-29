@@ -27,6 +27,9 @@ class Settings(BaseSettings):
 
     TELEGRAM_TOKEN: str = ""
     BOT_USERNAME: str = ""
+    # public channel/chat for signal showcase, e.g. "-1001234567890" or "@tbx_signals";
+    # the bot must be an admin of the channel
+    TELEGRAM_SIGNALS_CHANNEL_ID: str = ""
 
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"

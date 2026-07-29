@@ -23,6 +23,9 @@ logger = logging.getLogger("tbx.market_data.collector")
 
 TRADE_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
 TIMEFRAME = "1h"
+HTF_TIMEFRAME = "4h"  # higher-timeframe bias for signal confirmation
+HTF_CANDLES = 200
+HTF_REFRESH_SECONDS = 4 * 3600
 LOOKBACK_CANDLES = 500
 MAX_RETRY_DELAY = 300
 
@@ -99,9 +102,10 @@ async def fetch_historical_ohlcv(exchange: ccxt_pro.Exchange, symbol: str, timef
         return []
 
 
-async def generate_and_store_signal(symbol: str, df: pd.DataFrame) -> Optional[Signal]:
+async def generate_and_store_signal(symbol: str, df: pd.DataFrame,
+                                    htf_df: Optional[pd.DataFrame] = None) -> Optional[Signal]:
     strategy_engine = get_smc_strategy()
-    signal_result = strategy_engine.generate_signal(df, symbol)
+    signal_result = strategy_engine.generate_signal(df, symbol, htf_df=htf_df)
 
     if signal_result.direction == "NONE" or signal_result.confidence < 50:
         return None
@@ -137,7 +141,8 @@ async def generate_and_store_signal(symbol: str, df: pd.DataFrame) -> Optional[S
             return None
 
 
-async def process_closed_candle(symbol: str, candle: list, buffer: CandleBuffer):
+async def process_closed_candle(symbol: str, candle: list, buffer: CandleBuffer,
+                                htf_df: Optional[pd.DataFrame] = None):
     try:
         redis = await get_redis()
         await cache_ohlcv(redis, symbol, TIMEFRAME, list(buffer.candles)[-100:])
@@ -149,7 +154,7 @@ async def process_closed_candle(symbol: str, candle: list, buffer: CandleBuffer)
         return
 
     try:
-        signal = await generate_and_store_signal(symbol, buffer.to_dataframe())
+        signal = await generate_and_store_signal(symbol, buffer.to_dataframe(), htf_df)
         if signal:
             await notify_signal(signal)
     except Exception as e:
@@ -241,6 +246,19 @@ async def _symbol_loop(exchange: ccxt_pro.Exchange, symbol: str):
             retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
 
 
+async def _fetch_htf(exchange: ccxt_pro.Exchange, symbol: str) -> Optional[pd.DataFrame]:
+    try:
+        raw = await exchange.fetch_ohlcv(symbol, HTF_TIMEFRAME, limit=HTF_CANDLES)
+        if not raw or len(raw) < 50:
+            return None
+        df = pd.DataFrame(raw[:-1], columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
+    except Exception as e:
+        logger.warning("HTF fetch failed for %s: %s", symbol, e)
+        return None
+
+
 async def _watch_and_signal_symbol(exchange: ccxt_pro.Exchange, symbol: str):
     buffer = CandleBuffer()
     raw = await fetch_historical_ohlcv(exchange, symbol, TIMEFRAME)
@@ -249,6 +267,10 @@ async def _watch_and_signal_symbol(exchange: ccxt_pro.Exchange, symbol: str):
 
     buffer.seed(raw)
     forming = raw[-1]
+
+    # 4h bias refreshes once per HTF candle — one REST call per 4 hours
+    htf_df = await _fetch_htf(exchange, symbol)
+    htf_fetched_at = time.monotonic()
 
     while True:
         ohlcv = await exchange.watch_ohlcv(symbol, TIMEFRAME)
@@ -260,7 +282,12 @@ async def _watch_and_signal_symbol(exchange: ccxt_pro.Exchange, symbol: str):
             else:
                 # a new candle opened — the previous one is now closed
                 buffer.append_closed(forming)
-                await process_closed_candle(symbol, forming, buffer)
+                if time.monotonic() - htf_fetched_at > HTF_REFRESH_SECONDS:
+                    fresh = await _fetch_htf(exchange, symbol)
+                    if fresh is not None:
+                        htf_df = fresh
+                    htf_fetched_at = time.monotonic()
+                await process_closed_candle(symbol, forming, buffer, htf_df)
                 forming = candle
 
 

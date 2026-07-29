@@ -56,12 +56,18 @@ async def _eligible_telegram_ids() -> list[int]:
 
 async def _broadcast_signal(payload: dict):
     from app.bot.bot import send_message_safe
+    from app.config import settings
+
+    text = format_signal_message(payload)
+
+    # public showcase channel first — it doubles as the live track record
+    if settings.TELEGRAM_SIGNALS_CHANNEL_ID:
+        await send_message_safe(settings.TELEGRAM_SIGNALS_CHANNEL_ID, text)
 
     telegram_ids = await _eligible_telegram_ids()
     if not telegram_ids:
         return
 
-    text = format_signal_message(payload)
     sent = 0
     for telegram_id in telegram_ids:
         if await send_message_safe(telegram_id, text):

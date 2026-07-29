@@ -137,7 +137,7 @@ async def stop_bot():
         logger.info("Telegram Bot stopped")
 
 
-async def send_message_safe(telegram_id: int, text: str, parse_mode: str | None = None) -> bool:
+async def send_message_safe(telegram_id: int | str, text: str, parse_mode: str | None = None) -> bool:
     """Send a message if the bot is running; never raises (blocked users, bot off, etc.)."""
     if _application is None:
         return False
