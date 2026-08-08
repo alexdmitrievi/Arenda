@@ -20,8 +20,40 @@ logger = logging.getLogger("tbx.scheduler")
 
 SUBSCRIPTION_INTERVAL = 3600
 RECONCILE_INTERVAL = 300
+MARKET_CONTEXT_INTERVAL = 1800
 PENDING_TRADE_TIMEOUT = timedelta(minutes=10)
 REMINDER_WINDOW = timedelta(days=3)
+
+
+async def market_context_loop():
+    """Refreshes the market-context snapshot (BTC bias, altseason, macro) in Redis."""
+    import ccxt.async_support as ccxt_async
+
+    from app.config import settings
+    from app.services.market_context.engine import compute_context, store_context
+
+    while True:
+        exchange = ccxt_async.binance({"enableRateLimit": True})
+        try:
+            context = await compute_context(
+                exchange, getattr(settings, "MACRO_EVENTS_JSON", "")
+            )
+            await store_context(context)
+            logger.info(
+                "Market context: btc=%s altseason=%s blackout=%s",
+                context["btc"]["mode"], context["altseason"]["score"],
+                context["macro_blackout"]["active"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Market context refresh failed: %s", e)
+        finally:
+            try:
+                await exchange.close()
+            except Exception:
+                pass
+        await asyncio.sleep(MARKET_CONTEXT_INTERVAL)
 
 
 async def subscription_maintenance_loop():
@@ -29,6 +61,7 @@ async def subscription_maintenance_loop():
         try:
             await _expire_subscriptions()
             await _send_expiry_reminders()
+            await _send_weekly_dca_reminder()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -53,6 +86,45 @@ async def _expire_subscriptions():
         await db.commit()
     if expired:
         logger.info("Marked %d subscriptions as expired", len(expired))
+
+
+async def _send_weekly_dca_reminder():
+    """Monday nudge for investors: the weekly DCA window is open."""
+    from app.bot.bot import send_message_safe
+
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 0 or now.hour < 12:
+        return
+
+    redis = await get_redis()
+    if not await redis.set(f"remind:dca:{now.isocalendar().week}", "1", ex=6 * 86400, nx=True):
+        return
+
+    from sqlalchemy import or_
+
+    async with async_session_factory() as db:
+        active_ids = select(Subscription.user_id).where(
+            Subscription.status.in_([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL]),
+            or_(Subscription.expires_at.is_(None), Subscription.expires_at > now),
+        )
+        rows = await db.execute(
+            select(User.telegram_id).where(
+                User.telegram_id.is_not(None),
+                User.is_active.is_(True),
+                or_(User.referred_by.is_not(None), User.id.in_(active_ids)),
+            )
+        )
+        telegram_ids = list(rows.scalars().all())
+
+    for telegram_id in telegram_ids:
+        await send_message_safe(
+            telegram_id,
+            "📅 Еженедельное DCA-окно открыто. Загляните в раздел «Инвестор» — "
+            "план покупок уже рассчитан с учётом просадок и фазы рынка.",
+        )
+        await asyncio.sleep(0.05)
+    if telegram_ids:
+        logger.info("Weekly DCA reminder sent to %d users", len(telegram_ids))
 
 
 async def _send_expiry_reminders():
@@ -131,4 +203,5 @@ def start_scheduler() -> list[asyncio.Task]:
     return [
         asyncio.create_task(subscription_maintenance_loop()),
         asyncio.create_task(trade_reconciliation_loop()),
+        asyncio.create_task(market_context_loop()),
     ]

@@ -122,11 +122,43 @@ async def fetch_historical_ohlcv(exchange: ccxt_pro.Exchange, symbol: str, timef
 
 async def generate_and_store_signal(symbol: str, df: pd.DataFrame,
                                     htf_df: Optional[pd.DataFrame] = None) -> Optional[Signal]:
+    from app.services.market_context.engine import load_context, macro_blackout
+
+    # macro blackout is schedule-based and cheap — always computed fresh
+    blackout = macro_blackout(extra_events_json=settings.MACRO_EVENTS_JSON)
+    if blackout["active"]:
+        logger.info("Signal suppressed for %s: macro blackout (%s until %s)",
+                    symbol, blackout["event"], blackout["until"])
+        return None
+
     strategy_engine = get_smc_strategy()
     signal_result = strategy_engine.generate_signal(df, symbol, htf_df=htf_df)
 
     if signal_result.direction == "NONE" or signal_result.confidence < 50:
         return None
+
+    # BTC is the guide dog: while it holds bearish structure on 4h AND 1d,
+    # long signals across the board are suppressed; one bearish TF costs
+    # a confidence penalty instead of a hard veto
+    context = await load_context()
+    if context and signal_result.direction == "BUY":
+        btc_mode = context.get("btc", {}).get("mode")
+        if btc_mode == "RISK_OFF":
+            logger.info("BUY signal suppressed for %s: BTC bearish on 4h+1d", symbol)
+            return None
+        if btc_mode == "CAUTION":
+            signal_result.confidence = max(0, signal_result.confidence - 10)
+            signal_result.metadata.setdefault("reasons", []).append(
+                "BTC частично медвежий (4h или 1d) — штраф к уверенности"
+            )
+            if signal_result.confidence < 50:
+                return None
+    if context:
+        signal_result.metadata["market_context"] = {
+            "btc_mode": context.get("btc", {}).get("mode"),
+            "altseason": context.get("altseason", {}).get("score"),
+            "cycle_phase": context.get("cycle", {}).get("phase"),
+        }
 
     async with async_session_factory() as db:
         try:
