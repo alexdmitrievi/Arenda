@@ -15,6 +15,31 @@ small REAL deposit ($200-500).
 Work in two phases. Do NOT write code during Phase 1.
 
 ===============================================================================
+LANGUAGE — APPLIES TO EVERYTHING YOU SAY
+===============================================================================
+
+This prompt is in English, but the project owner is a Russian speaker.
+
+WRITE EVERY WORD ADDRESSED TO THE HUMAN IN RUSSIAN:
+- the plan you produce in Phase 1 — in Russian
+- every question you ask, every clarification you request — in Russian
+- all progress reports, summaries, risk warnings, backtest conclusions — in Russian
+- explanations of what you changed and why — in Russian
+
+KEEP THESE IN ENGLISH (they live in the repository, not in the conversation):
+- source code, identifiers, code comments, docstrings
+- git commit messages and pull request titles/bodies
+- log messages, exception texts, and API error strings
+- file and directory names
+
+If a technical term has no natural Russian equivalent, use the English term
+inside a Russian sentence (e.g. "expectancy после комиссий", "kill switch",
+"stop-loss"). Do not translate identifiers or file paths.
+
+Never answer in English. If you catch yourself writing an English sentence
+addressed to the human, rewrite it in Russian before sending.
+
+===============================================================================
 PHASE 1 — PLAN MODE (investigate first, no code changes)
 ===============================================================================
 
@@ -47,6 +72,9 @@ Read the codebase and produce a written plan. Specifically:
 4. Deliver a plan ordered by risk, with per-task acceptance criteria and an
    estimate. Flag anything in this prompt that you believe is wrong or outdated
    after reading the code — the code is the source of truth, not this document.
+
+   WRITE THE PLAN IN RUSSIAN. Keep file paths, identifiers and file:line
+   references verbatim in English inside the Russian text.
 
 Only after presenting the plan, switch to Build mode and implement it in the
 order defined below.
@@ -241,10 +269,16 @@ HARD CONSTRAINTS — NEVER VIOLATE
 REPORTING FORMAT
 ===============================================================================
 
-Work block by block. After each block, report:
-- the files you changed
-- the test run output
+ALL REPORTS ARE WRITTEN IN RUSSIAN (see the LANGUAGE section above).
+
+Work block by block. After each block, report — in Russian:
+- the files you changed (paths verbatim in English)
+- the test run output (raw output as-is, your commentary in Russian)
 - what remains unverified and where the risk sits
+
+Ask every question in Russian too. If a decision is the owner's to make —
+which pairs to drop after the backtest, whether to go live — stop and ask in
+Russian rather than deciding for them.
 
 Start with 1.1, the backtest. Until there is evidence of positive expectancy
 after fees, real money must stay off the table and everything else is secondary.
