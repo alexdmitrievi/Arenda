@@ -143,3 +143,180 @@ class TestSMCStrategy:
         assert result.total_trades >= 0
         assert 0 <= result.win_rate <= 100
         assert result.max_drawdown_pct >= 0
+
+
+class TestSignalGeometry:
+    """Directional invariants: SL and every TP must sit on the correct side of entry."""
+
+    def _fib(self, high: float, low: float) -> dict:
+        return FibonacciCalculator.retracement(high, low)
+
+    def test_buy_targets_above_entry(self):
+        gen = SignalGenerator()
+        entry, stop = 100.0, 95.0
+        tps = gen._find_targets(entry, stop, "BUY")
+        assert all(tp > entry for tp in tps)
+        assert tps == sorted(tps)
+
+    def test_sell_targets_below_entry(self):
+        gen = SignalGenerator()
+        entry, stop = 100.0, 105.0
+        tps = gen._find_targets(entry, stop, "SELL")
+        assert all(tp < entry for tp in tps)
+        assert tps == sorted(tps, reverse=True)
+
+    def test_targets_scale_with_risk(self):
+        gen = SignalGenerator()
+        tps = gen._find_targets(100.0, 98.0, "BUY")
+        assert tps == [106.0, 110.0, 114.0]
+        tps = gen._find_targets(100.0, 102.0, "SELL")
+        assert tps == [94.0, 90.0, 86.0]
+
+    def test_zero_risk_does_not_crash(self):
+        gen = SignalGenerator()
+        tps = gen._find_targets(100.0, 100.0, "BUY")
+        assert len(tps) == 3
+        assert all(tp > 100.0 for tp in tps)
+
+    def test_buy_entry_in_discount(self):
+        gen = SignalGenerator()
+        fib = self._fib(high=110.0, low=100.0)
+        entry = gen._find_entry(105.0, fib, "BUY")
+        assert entry < (110.0 + 100.0) / 2
+
+    def test_sell_entry_in_premium(self):
+        gen = SignalGenerator()
+        fib = self._fib(high=110.0, low=100.0)
+        entry = gen._find_entry(105.0, fib, "SELL")
+        assert entry > (110.0 + 100.0) / 2
+
+    def test_generated_sell_signal_geometry(self):
+        """End-to-end: any SELL signal must have TP < entry < SL."""
+        np.random.seed(7)
+        strategy = SMCStrategy(min_rr_ratio=1.0, min_confidence=40)
+        for seed in range(20):
+            np.random.seed(seed)
+            df = make_trending_down(250)
+            signal = strategy.generate_signal(df, "TEST")
+            if signal.direction == "SELL":
+                assert signal.stop_loss > signal.entry
+                assert all(tp < signal.entry for tp in signal.take_profit)
+
+    def test_generated_buy_signal_geometry(self):
+        """End-to-end: any BUY signal must have SL < entry < TP."""
+        for seed in range(20):
+            np.random.seed(seed)
+            df = make_trending_up(250)
+            signal = SMCStrategy(min_rr_ratio=1.0, min_confidence=40).generate_signal(df, "TEST")
+            if signal.direction == "BUY":
+                assert signal.stop_loss < signal.entry
+                assert all(tp > signal.entry for tp in signal.take_profit)
+
+
+class TestRegimeDetection:
+
+    def test_trend_regime_on_strong_move(self):
+        # steady climb with narrow candles: EMA displacement far exceeds ATR
+        rows = []
+        for i in range(200):
+            p = 100 + i
+            rows.append({"timestamp": i, "open": p - 0.2, "high": p + 0.5,
+                         "low": p - 0.5, "close": p, "volume": 1})
+        df = pd.DataFrame(rows)
+        regime = StructuralAnalysis.detect_regime(df)
+        assert regime["regime"] == "TREND"
+
+    def test_insufficient_data_defaults_to_range(self):
+        df = make_ohlcv([100 + i * 0.1 for i in range(30)])
+        regime = StructuralAnalysis.detect_regime(df)
+        assert regime["regime"] == "RANGE"
+
+    def test_regime_keys_present(self):
+        np.random.seed(2)
+        df = make_trending_up(200)
+        regime = StructuralAnalysis.detect_regime(df)
+        assert set(regime) == {"regime", "slope_atr", "atr_rank"}
+
+
+class TestLiquiditySweeps:
+
+    def _df_with_sweep_below(self) -> pd.DataFrame:
+        # flat tape with equal lows at ~98, then the last candle wicks below and closes back
+        rows = []
+        for i in range(60):
+            rows.append({"timestamp": i, "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1})
+        rows[20]["low"] = 98.0
+        rows[40]["low"] = 98.0
+        rows.append({"timestamp": 60, "open": 100, "high": 100.5, "low": 97.5, "close": 100.2, "volume": 1})
+        return pd.DataFrame(rows)
+
+    def test_bullish_sweep_detected(self):
+        df = self._df_with_sweep_below()
+        liquidity = [{"price": 98.0, "type": "BUY_SIDE", "count": 2}]
+        sweeps = StructuralAnalysis.detect_liquidity_sweeps(df, liquidity)
+        assert any(s["type"] == "BULLISH_SWEEP" for s in sweeps)
+
+    def test_no_sweep_without_reclaim(self):
+        # candle breaks the level and CLOSES below → breakdown, not a sweep
+        rows = [{"timestamp": i, "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1}
+                for i in range(60)]
+        rows.append({"timestamp": 60, "open": 100, "high": 100.2, "low": 97.5, "close": 97.6, "volume": 1})
+        df = pd.DataFrame(rows)
+        liquidity = [{"price": 98.0, "type": "BUY_SIDE", "count": 2}]
+        sweeps = StructuralAnalysis.detect_liquidity_sweeps(df, liquidity)
+        assert not any(s["type"] == "BULLISH_SWEEP" for s in sweeps)
+
+
+class TestHTFBias:
+
+    def test_htf_neutral_without_data(self):
+        strategy = SMCStrategy()
+        assert strategy._htf_trend(None) == "NEUTRAL"
+        assert strategy._htf_trend(make_ohlcv([100] * 20)) == "NEUTRAL"
+
+    def test_htf_conflict_reduces_confidence(self):
+        gen = SignalGenerator()
+        fib = FibonacciCalculator.retracement(110, 100)
+        highs = [SwingPoint(20, 130.0, True)]
+        lows = [SwingPoint(10, 95.0, False)]
+        args = (100.0, "BULLISH", fib, [], [], [], highs, lows)
+        with_htf, _ = gen._evaluate_buy(*args, [], {"regime": "TREND"}, "BULLISH")
+        against_htf, _ = gen._evaluate_buy(*args, [], {"regime": "TREND"}, "BEARISH")
+        assert with_htf > against_htf
+
+
+class TestHonestBacktest:
+
+    def test_chop_veto_returns_none(self):
+        gen = SignalGenerator()
+        np.random.seed(4)
+        df = make_trending_up(200)
+        result = gen.generate(df, [], [], [], [], [], "X", regime={"regime": "CHOP"})
+        assert result.direction == "NONE"
+        assert result.confidence == 0
+
+    def test_backtest_charges_costs(self):
+        np.random.seed(5)
+        df = make_trending_up(400, 100, 0.4)
+        strategy = SMCStrategy(min_rr_ratio=1.0, min_confidence=30)
+        result = strategy.backtest(df, "TEST")
+        if result.total_trades > 0:
+            assert result.costs_pct > 0
+            for t in result.trades:
+                assert t["costs_pct"] > 0
+
+    def test_backtest_has_expectancy_field(self):
+        np.random.seed(6)
+        df = make_trending_up(300, 100, 0.3)
+        strategy = SMCStrategy(min_rr_ratio=1.0, min_confidence=30)
+        result = strategy.backtest(df, "TEST")
+        assert hasattr(result, "expectancy_pct")
+        assert hasattr(result, "expired_signals")
+
+    def test_same_bar_stop_wins(self):
+        """If one bar spans entry AND stop, the trade must be counted as SL."""
+        from app.services.strategies.base import AbstractStrategy
+        position = {"direction": "BUY", "entry": 100.0, "stop": 95.0, "tp": 115.0, "held_bars": 0}
+        trade = AbstractStrategy._close_trade(position, 95.0, "SL")
+        assert trade["result"] == "SL"
+        assert trade["pnl_pct"] < 0

@@ -135,3 +135,15 @@ async def stop_bot():
         await _application.shutdown()
         _application = None
         logger.info("Telegram Bot stopped")
+
+
+async def send_message_safe(telegram_id: int | str, text: str, parse_mode: str | None = None) -> bool:
+    """Send a message if the bot is running; never raises (blocked users, bot off, etc.)."""
+    if _application is None:
+        return False
+    try:
+        await _application.bot.send_message(chat_id=telegram_id, text=text, parse_mode=parse_mode)
+        return True
+    except Exception as e:
+        logger.warning("Failed to send message to %s: %s", telegram_id, e)
+        return False

@@ -33,13 +33,25 @@ class PaymentStatus(StrEnum):
     REFUNDED = "refunded"
 
 
-PLAN_PRICES: dict[SubscriptionPlan, Decimal] = {
+PLAN_PRICES_USD: dict[SubscriptionPlan, Decimal] = {
     SubscriptionPlan.DEMO: Decimal("0"),
     SubscriptionPlan.TRADER: Decimal("29.00"),
     SubscriptionPlan.INVESTOR_PRO: Decimal("79.00"),
     SubscriptionPlan.PROP_FIRM_MASTER: Decimal("149.00"),
     SubscriptionPlan.ENTERPRISE: Decimal("0"),
 }
+
+# Fixed RUB prices — never derived from a live FX rate so charges stay predictable.
+PLAN_PRICES_RUB: dict[SubscriptionPlan, Decimal] = {
+    SubscriptionPlan.DEMO: Decimal("0"),
+    SubscriptionPlan.TRADER: Decimal("2900.00"),
+    SubscriptionPlan.INVESTOR_PRO: Decimal("7900.00"),
+    SubscriptionPlan.PROP_FIRM_MASTER: Decimal("14900.00"),
+    SubscriptionPlan.ENTERPRISE: Decimal("0"),
+}
+
+# CryptoCloud charges in USDT ≈ USD
+PLAN_PRICES = PLAN_PRICES_USD
 
 PLAN_FEATURES: dict[SubscriptionPlan, list[str]] = {
     SubscriptionPlan.DEMO: [

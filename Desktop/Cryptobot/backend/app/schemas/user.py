@@ -62,6 +62,7 @@ class ExchangeKeySet(BaseModel):
     api_key: str = Field(min_length=1)
     secret: str = Field(min_length=1)
     passphrase: str | None = None
+    risk_per_trade_pct: float | None = Field(default=None, ge=0.1, le=10.0)
 
 
 class ExchangeKeyResponse(BaseModel):

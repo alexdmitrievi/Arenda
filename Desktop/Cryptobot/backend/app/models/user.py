@@ -3,6 +3,7 @@ from enum import StrEnum
 
 from sqlalchemy import BigInteger, Boolean, DateTime, Enum, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDMixin
@@ -32,8 +33,10 @@ class User(Base, UUIDMixin, TimestampMixin):
     role: Mapped[UserRole] = mapped_column(
         Enum(UserRole, name="user_role"), default=UserRole.USER
     )
+    # MutableDict: in-place mutations must mark the column dirty, otherwise
+    # adding a second exchange key is silently lost at flush time
     exchange_keys_encrypted: Mapped[dict | None] = mapped_column(
-        JSONB, default=None, nullable=True
+        MutableDict.as_mutable(JSONB), default=None, nullable=True
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)

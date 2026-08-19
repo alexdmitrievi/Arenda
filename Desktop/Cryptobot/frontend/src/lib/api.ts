@@ -18,9 +18,59 @@ export function getToken(): string | null {
   return authToken;
 }
 
+export function setRefreshToken(token: string | null) {
+  if (token) {
+    localStorage.setItem("tbx_refresh_token", token);
+  } else {
+    localStorage.removeItem("tbx_refresh_token");
+  }
+}
+
+function getRefreshToken(): string | null {
+  return localStorage.getItem("tbx_refresh_token");
+}
+
+let refreshPromise: Promise<boolean> | null = null;
+
+async function tryRefresh(): Promise<boolean> {
+  // deduplicate: parallel 401s must trigger a single refresh request
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      const refreshToken = getRefreshToken();
+      if (!refreshToken) return false;
+      try {
+        const res = await fetch(`${API_BASE}/auth/token/refresh`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+        if (!res.ok) return false;
+        const data = await res.json();
+        setToken(data.access_token);
+        setRefreshToken(data.refresh_token);
+        return true;
+      } catch {
+        return false;
+      }
+    })().finally(() => {
+      refreshPromise = null;
+    });
+  }
+  return refreshPromise;
+}
+
+function logoutToLogin(): void {
+  setToken(null);
+  setRefreshToken(null);
+  if (typeof window !== "undefined") {
+    window.location.href = "/login";
+  }
+}
+
 async function api<T>(
   path: string,
-  options: RequestInit = {}
+  options: RequestInit = {},
+  isRetry = false
 ): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -38,10 +88,10 @@ async function api<T>(
   });
 
   if (res.status === 401) {
-    setToken(null);
-    if (typeof window !== "undefined") {
-      window.location.href = "/login";
+    if (!isRetry && (await tryRefresh())) {
+      return api<T>(path, options, true);
     }
+    logoutToLogin();
     throw new Error("Unauthorized");
   }
 
@@ -105,19 +155,35 @@ export interface TradesResponse {
   trades: Trade[];
 }
 
-export async function login(email: string, password: string): Promise<{ access_token: string }> {
-  const res = await api<{ access_token: string; token_type: string }>("/auth/login", {
-    method: "POST",
-    body: JSON.stringify({ email, password }),
-  });
+export async function login(
+  email: string,
+  password: string
+): Promise<{ access_token: string; refresh_token: string }> {
+  const res = await api<{ access_token: string; refresh_token: string; token_type: string }>(
+    "/auth/login",
+    {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    }
+  );
+  setRefreshToken(res.refresh_token);
   return res;
 }
 
-export async function register(email: string, password: string, username: string) {
-  return api("/auth/register", {
-    method: "POST",
-    body: JSON.stringify({ email, password, username }),
-  });
+export async function register(
+  email: string,
+  password: string,
+  username: string
+): Promise<{ access_token: string; refresh_token: string }> {
+  const res = await api<{ access_token: string; refresh_token: string; token_type: string }>(
+    "/auth/register",
+    {
+      method: "POST",
+      body: JSON.stringify({ email, password, username }),
+    }
+  );
+  setRefreshToken(res.refresh_token);
+  return res;
 }
 
 export async function fetchSignals(hours = 24): Promise<SignalsResponse> {
@@ -157,6 +223,7 @@ export async function updateUserSettings(settings: {
         exchange: settings.exchange,
         api_key: settings.api_key,
         secret: settings.secret,
+        risk_per_trade_pct: settings.risk_per_trade_pct,
       }),
     });
   }
@@ -168,4 +235,21 @@ export async function updateUserSettings(settings: {
 
 export async function getExchangeKeys(): Promise<{ exchange: string; api_key_masked: string }[]> {
   return api("/users/me/exchange-keys");
+}
+
+export function createSignalStream(onSignal: (signal: Signal) => void): EventSource | null {
+  const token = getToken();
+  if (!token || typeof window === "undefined") return null;
+
+  const source = new EventSource(
+    `${API_BASE}/trading/signals/stream?token=${encodeURIComponent(token)}`
+  );
+  source.onmessage = (event) => {
+    try {
+      onSignal(JSON.parse(event.data));
+    } catch {
+      // keepalive or malformed frame — ignore
+    }
+  };
+  return source;
 }

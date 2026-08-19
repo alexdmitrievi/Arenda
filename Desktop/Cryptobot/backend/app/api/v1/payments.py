@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import logging
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
@@ -97,6 +97,12 @@ async def create_payment_endpoint(
     current_user: CurrentUser,
     db: DbSession,
 ):
+    from app.config import settings
+    if not settings.YOOKASSA_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Card payments are disabled. Pay with USDT via CryptoCloud.",
+        )
     if request.plan == SubscriptionPlan.DEMO:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -206,6 +212,8 @@ async def yookassa_webhook(
                     Subscription.user_id == payment.user_id,
                     Subscription.status.in_([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL]),
                 )
+                .order_by(Subscription.created_at.desc())
+                .limit(1)
             )
             existing_sub = sub_result.scalar_one_or_none()
 
@@ -284,6 +292,7 @@ async def create_invoice(
         date=datetime.now(timezone.utc),
     )
 
+    # НПД/УСН: услуга НДС не облагается — сумма и итог совпадают
     invoice = Invoice(
         user_id=current_user.id,
         invoice_number=invoice_number,
@@ -291,8 +300,8 @@ async def create_invoice(
         company_inn=request.company_inn,
         company_kpp=request.company_kpp,
         amount=price,
-        vat_rate=4,
-        vat_amount=price * Decimal("0.20"),
+        vat_rate=0,
+        vat_amount=Decimal("0"),
         total=price,
     )
     db.add(invoice)
@@ -302,7 +311,7 @@ async def create_invoice(
         "invoice_id": str(invoice.id),
         "invoice_number": invoice_number,
         "amount": f"{price:.2f}",
-        "vat": f"{price * Decimal('0.20'):.2f}",
+        "vat": "0.00",
         "total": f"{price:.2f}",
         "html": html,
     }
@@ -320,6 +329,7 @@ async def get_my_subscription(
             Subscription.status.in_([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL]),
         )
         .order_by(Subscription.created_at.desc())
+        .limit(1)
     )
     sub = result.scalar_one_or_none()
 
@@ -434,7 +444,11 @@ async def cryptocloud_webhook(
     if not order_id:
         return {"status": "missing order_id"}
 
-    amount_received = Decimal(str(data.get("amount", 0)))
+    try:
+        amount_received = Decimal(str(data.get("amount") or "0"))
+    except InvalidOperation:
+        logger.error("CryptoCloud: unparseable amount %r for order %s", data.get("amount"), order_id)
+        return {"status": "bad amount"}
     currency = str(data.get("currency", "USDT"))
 
     try:
@@ -445,11 +459,20 @@ async def cryptocloud_webhook(
         logger.error("CryptoCloud: bad order_id %s", order_id)
         return {"status": "bad order_id"}
 
-    plan = SubscriptionPlan(plan_str) if plan_str in SubscriptionPlan.__members__ else SubscriptionPlan.TRADER
+    try:
+        plan = SubscriptionPlan(plan_str)
+    except ValueError:
+        logger.error("CryptoCloud: unknown plan %r in order %s", plan_str, order_id)
+        return {"status": "bad plan"}
+
     expected_amount = PLAN_PRICES.get(plan, Decimal("29"))
 
-    if abs(amount_received - expected_amount) > Decimal("0.01"):
-        logger.warning("CryptoCloud: amount mismatch %s vs %s", amount_received, expected_amount)
+    if amount_received < expected_amount - Decimal("0.01"):
+        logger.warning(
+            "CryptoCloud: underpaid %s < %s for order %s — subscription NOT activated",
+            amount_received, expected_amount, order_id,
+        )
+        return {"status": "underpaid"}
 
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
@@ -459,14 +482,23 @@ async def cryptocloud_webhook(
 
     now = datetime.now(timezone.utc)
     sub_result = await db.execute(
-        select(Subscription).where(Subscription.user_id == user_id)
+        select(Subscription)
+        .where(Subscription.user_id == user_id)
+        .order_by(Subscription.created_at.desc())
+        .limit(1)
     )
     subscription = sub_result.scalar_one_or_none()
 
     if subscription:
+        # extend from the paid-until date, never overwrite remaining time
+        base = (
+            subscription.expires_at
+            if subscription.expires_at and subscription.expires_at > now
+            else now
+        )
         subscription.plan = plan
         subscription.status = SubscriptionStatus.ACTIVE
-        subscription.expires_at = now + timedelta(days=30)
+        subscription.expires_at = base + timedelta(days=30)
         subscription.started_at = subscription.started_at or now
     else:
         subscription = Subscription(

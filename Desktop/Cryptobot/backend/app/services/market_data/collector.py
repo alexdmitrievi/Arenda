@@ -1,5 +1,8 @@
 import asyncio
+import json
 import logging
+import time
+from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -18,9 +21,18 @@ from app.services.trading.market_data import cache_ohlcv, set_latest_price
 
 logger = logging.getLogger("tbx.market_data.collector")
 
-TRADE_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
-TIMEFRAMES = {"1h": "1h"}
+TRADE_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT",
+    "BNB/USDT", "ADA/USDT", "TRX/USDT", "TON/USDT", "LINK/USDT",
+    "AVAX/USDT", "SUI/USDT", "AAVE/USDT", "ENA/USDT", "ONDO/USDT",
+    "ZEC/USDT", "HYPE/USDT",
+]
+TIMEFRAME = "1h"
+HTF_TIMEFRAME = "4h"  # higher-timeframe bias for signal confirmation
+HTF_CANDLES = 200
+HTF_REFRESH_SECONDS = 4 * 3600
 LOOKBACK_CANDLES = 500
+MAX_RETRY_DELAY = 300
 
 _smc_strategy: Optional[SMCStrategy] = None
 
@@ -28,8 +40,55 @@ _smc_strategy: Optional[SMCStrategy] = None
 def get_smc_strategy() -> SMCStrategy:
     global _smc_strategy
     if _smc_strategy is None:
-        _smc_strategy = SMCStrategy(min_rr_ratio=2.0, min_confidence=50)
+        # RR 3:1 mandate: market structure must offer at least 3R to the first
+        # target, matching the 3R/5R/7R take-profit ladder
+        _smc_strategy = SMCStrategy(min_rr_ratio=3.0, min_confidence=50)
     return _smc_strategy
+
+
+async def _validate_symbols(exchange: ccxt_pro.Exchange) -> list[str]:
+    """Not every configured pair is guaranteed to be listed on the exchange —
+    skip missing ones loudly instead of retry-looping on them forever."""
+    await exchange.load_markets()
+    valid = [s for s in TRADE_SYMBOLS if s in exchange.markets]
+    missing = [s for s in TRADE_SYMBOLS if s not in exchange.markets]
+    if missing:
+        logger.warning("Symbols not listed on %s, skipped: %s", exchange.id, ", ".join(missing))
+    return valid
+
+
+class CandleBuffer:
+    """In-memory store of closed candles per symbol.
+
+    Seeded once over REST, then maintained from the WebSocket stream, so
+    signal generation never needs a REST round-trip per candle.
+    """
+
+    def __init__(self, maxlen: int = LOOKBACK_CANDLES):
+        self.candles: deque[list] = deque(maxlen=maxlen)
+
+    def seed(self, raw: list[list]) -> None:
+        self.candles.clear()
+        # the last element is the still-forming candle — keep closed ones only
+        for candle in raw[:-1]:
+            self.candles.append(candle)
+
+    def append_closed(self, candle: list) -> None:
+        if self.candles and self.candles[-1][0] == candle[0]:
+            self.candles[-1] = candle
+        else:
+            self.candles.append(candle)
+
+    def __len__(self) -> int:
+        return len(self.candles)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        df = pd.DataFrame(
+            list(self.candles),
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
 
 
 async def _get_or_create_smc_strategy(db: AsyncSession) -> Strategy:
@@ -41,7 +100,7 @@ async def _get_or_create_smc_strategy(db: AsyncSession) -> Strategy:
         strategy = Strategy(
             name="SMC 1H Signals",
             type=StrategyType.SMC,
-            params={"min_rr_ratio": 2.0, "min_confidence": 50},
+            params={"min_rr_ratio": 3.0, "min_confidence": 50},
             is_active=True,
         )
         db.add(strategy)
@@ -49,33 +108,63 @@ async def _get_or_create_smc_strategy(db: AsyncSession) -> Strategy:
     return strategy
 
 
-async def fetch_historical_ohlcv(exchange: ccxt_pro.Exchange, symbol: str, timeframe: str) -> pd.DataFrame:
+async def fetch_historical_ohlcv(exchange: ccxt_pro.Exchange, symbol: str, timeframe: str) -> list[list]:
     try:
         raw = await exchange.fetch_ohlcv(symbol, timeframe, limit=LOOKBACK_CANDLES)
         if not raw or len(raw) < 50:
             logger.warning("Insufficient OHLCV data for %s: %d candles", symbol, len(raw) if raw else 0)
-            return pd.DataFrame()
-
-        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        return df
+            return []
+        return raw
     except Exception as e:
         logger.error("Failed to fetch OHLCV for %s %s: %s", symbol, timeframe, e)
-        return pd.DataFrame()
+        return []
 
 
-async def generate_and_store_signal(symbol: str, df: pd.DataFrame) -> Optional[Signal]:
+async def generate_and_store_signal(symbol: str, df: pd.DataFrame,
+                                    htf_df: Optional[pd.DataFrame] = None) -> Optional[Signal]:
+    from app.services.market_context.engine import load_context, macro_blackout
+
+    # macro blackout is schedule-based and cheap — always computed fresh
+    blackout = macro_blackout(extra_events_json=settings.MACRO_EVENTS_JSON)
+    if blackout["active"]:
+        logger.info("Signal suppressed for %s: macro blackout (%s until %s)",
+                    symbol, blackout["event"], blackout["until"])
+        return None
+
     strategy_engine = get_smc_strategy()
-    signal_result = strategy_engine.generate_signal(df, symbol.replace("/", "").replace("USDT", ""))
+    signal_result = strategy_engine.generate_signal(df, symbol, htf_df=htf_df)
 
     if signal_result.direction == "NONE" or signal_result.confidence < 50:
         return None
+
+    # BTC is the guide dog: while it holds bearish structure on 4h AND 1d,
+    # long signals across the board are suppressed; one bearish TF costs
+    # a confidence penalty instead of a hard veto
+    context = await load_context()
+    if context and signal_result.direction == "BUY":
+        btc_mode = context.get("btc", {}).get("mode")
+        if btc_mode == "RISK_OFF":
+            logger.info("BUY signal suppressed for %s: BTC bearish on 4h+1d", symbol)
+            return None
+        if btc_mode == "CAUTION":
+            signal_result.confidence = max(0, signal_result.confidence - 10)
+            signal_result.metadata.setdefault("reasons", []).append(
+                "BTC частично медвежий (4h или 1d) — штраф к уверенности"
+            )
+            if signal_result.confidence < 50:
+                return None
+    if context:
+        signal_result.metadata["market_context"] = {
+            "btc_mode": context.get("btc", {}).get("mode"),
+            "altseason": context.get("altseason", {}).get("score"),
+            "cycle_phase": context.get("cycle", {}).get("phase"),
+        }
 
     async with async_session_factory() as db:
         try:
             strategy = await _get_or_create_smc_strategy(db)
 
-            direction_map = {"BUY": "buy", "SELL": "sell", "NONE": "buy"}
+            direction_map = {"BUY": "buy", "SELL": "sell"}
             signal = Signal(
                 strategy_id=strategy.id,
                 symbol=symbol,
@@ -102,22 +191,20 @@ async def generate_and_store_signal(symbol: str, df: pd.DataFrame) -> Optional[S
             return None
 
 
-async def process_closed_candle(exchange: ccxt_pro.Exchange, symbol: str, candle: list):
+async def process_closed_candle(symbol: str, candle: list, buffer: CandleBuffer,
+                                htf_df: Optional[pd.DataFrame] = None):
     try:
         redis = await get_redis()
-        await cache_ohlcv(redis, symbol, "1h", [candle])
+        await cache_ohlcv(redis, symbol, TIMEFRAME, list(buffer.candles)[-100:])
         await set_latest_price(redis, symbol, float(candle[4]))
-
-        logger.debug("Candle cached: %s O=%.4f H=%.4f L=%.4f C=%.4f", symbol, *candle[1:5])
     except Exception as e:
         logger.error("Failed to cache candle for %s: %s", symbol, e)
 
-    try:
-        df = await fetch_historical_ohlcv(exchange, symbol, "1h")
-        if df.empty:
-            return
+    if len(buffer) < 50:
+        return
 
-        signal = await generate_and_store_signal(symbol, df)
+    try:
+        signal = await generate_and_store_signal(symbol, buffer.to_dataframe(), htf_df)
         if signal:
             await notify_signal(signal)
     except Exception as e:
@@ -127,7 +214,6 @@ async def process_closed_candle(exchange: ccxt_pro.Exchange, symbol: str, candle
 async def notify_signal(signal: Signal):
     try:
         redis = await get_redis()
-        import json
         payload = {
             "id": str(signal.id),
             "symbol": signal.symbol,
@@ -144,80 +230,118 @@ async def notify_signal(signal: Signal):
         logger.error("Failed to notify signal: %s", e)
 
 
-async def watch_ohlcv_loop():
+async def watch_tickers_loop():
+    """Keeps latest prices in Redis for the UI and paper trading."""
     exchange = ccxt_pro.binance({"enableRateLimit": True})
-    logger.info("Market Data Collector started. Watching %d symbols: %s", len(TRADE_SYMBOLS), ", ".join(TRADE_SYMBOLS))
+    symbols = await _validate_symbols(exchange)
+    logger.info("Ticker collector started for %d symbols", len(symbols))
 
     retry_delay = 5
-    max_retry_delay = 300
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                await _watch_tickers(exchange, symbols)
+            except asyncio.CancelledError:
+                logger.info("Ticker collector cancelled")
+                break
+            except Exception as e:
+                if time.monotonic() - started > 600:
+                    retry_delay = 5
+                logger.error("Ticker collector error, retrying in %ds: %s", retry_delay, e)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
+    finally:
+        await exchange.close()
 
+
+async def _watch_tickers(exchange: ccxt_pro.Exchange, symbols: list[str]):
     while True:
-        try:
-            await _watch(exchange)
-        except asyncio.CancelledError:
-            logger.info("Market Data Collector cancelled")
-            break
-        except Exception as e:
-            retry_delay = min(retry_delay * 2, max_retry_delay)
-            logger.error("Collector error, retrying in %ds: %s", retry_delay, e)
-            await asyncio.sleep(retry_delay)
-        finally:
-            retry_delay = 5
-
-
-async def _watch(exchange: ccxt_pro.Exchange):
-    while True:
-        tickers = await exchange.watch_tickers(TRADE_SYMBOLS)
+        tickers = await exchange.watch_tickers(symbols)
+        redis = await get_redis()
         for symbol, ticker in tickers.items():
-            if ticker:
+            if ticker and ticker.get("last"):
                 try:
-                    redis = await get_redis()
-                    await set_latest_price(redis, symbol, float(ticker.get("last", 0)))
+                    await set_latest_price(redis, symbol, float(ticker["last"]))
                 except Exception:
                     pass
 
 
 async def start_collector():
-    task = asyncio.create_task(watch_ohlcv_loop())
-    return task
+    return asyncio.create_task(watch_tickers_loop())
 
 
 async def watch_and_signal_loop():
     exchange = ccxt_pro.binance({"enableRateLimit": True})
-    logger.info("Signal Engine started. Symbols: %s", ", ".join(TRADE_SYMBOLS))
+    symbols = await _validate_symbols(exchange)
+    logger.info("Signal Engine started. Symbols: %s", ", ".join(symbols))
+    try:
+        await asyncio.gather(*(_symbol_loop(exchange, s) for s in symbols))
+    finally:
+        await exchange.close()
 
+
+async def _symbol_loop(exchange: ccxt_pro.Exchange, symbol: str):
     retry_delay = 5
-    max_retry_delay = 300
-
     while True:
+        started = time.monotonic()
         try:
-            for symbol in TRADE_SYMBOLS:
-                await _watch_and_signal_symbol(exchange, symbol)
+            await _watch_and_signal_symbol(exchange, symbol)
         except asyncio.CancelledError:
-            logger.info("Signal Engine cancelled")
-            break
+            logger.info("Signal engine cancelled for %s", symbol)
+            raise
         except Exception as e:
-            retry_delay = min(retry_delay * 2, max_retry_delay)
-            logger.error("Signal engine error, retrying in %ds: %s", retry_delay, e)
+            if time.monotonic() - started > 600:
+                retry_delay = 5
+            logger.error("Signal engine error for %s, retrying in %ds: %s", symbol, retry_delay, e)
             await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
+
+
+async def _fetch_htf(exchange: ccxt_pro.Exchange, symbol: str) -> Optional[pd.DataFrame]:
+    try:
+        raw = await exchange.fetch_ohlcv(symbol, HTF_TIMEFRAME, limit=HTF_CANDLES)
+        if not raw or len(raw) < 50:
+            return None
+        df = pd.DataFrame(raw[:-1], columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
+    except Exception as e:
+        logger.warning("HTF fetch failed for %s: %s", symbol, e)
+        return None
 
 
 async def _watch_and_signal_symbol(exchange: ccxt_pro.Exchange, symbol: str):
-    last_processed_ts = 0
+    buffer = CandleBuffer()
+    raw = await fetch_historical_ohlcv(exchange, symbol, TIMEFRAME)
+    if not raw:
+        raise RuntimeError(f"Could not seed candle buffer for {symbol}")
+
+    buffer.seed(raw)
+    forming = raw[-1]
+
+    # 4h bias refreshes once per HTF candle — one REST call per 4 hours
+    htf_df = await _fetch_htf(exchange, symbol)
+    htf_fetched_at = time.monotonic()
 
     while True:
-        ohlcv = await exchange.watch_ohlcv(symbol, "1h")
-        if ohlcv and len(ohlcv) > 0:
-            latest = ohlcv[-1]
-            candle_ts = latest[0]
-
-            if candle_ts > last_processed_ts and candle_ts > 0:
-                last_processed_ts = candle_ts
-                await process_closed_candle(exchange, symbol, latest)
-
-        await asyncio.sleep(5)
+        ohlcv = await exchange.watch_ohlcv(symbol, TIMEFRAME)
+        for candle in ohlcv:
+            if candle[0] < forming[0]:
+                continue
+            if candle[0] == forming[0]:
+                forming = candle
+            else:
+                # a new candle opened — the previous one is now closed
+                buffer.append_closed(forming)
+                if time.monotonic() - htf_fetched_at > HTF_REFRESH_SECONDS:
+                    fresh = await _fetch_htf(exchange, symbol)
+                    if fresh is not None:
+                        htf_df = fresh
+                    htf_fetched_at = time.monotonic()
+                await process_closed_candle(symbol, forming, buffer, htf_df)
+                forming = candle
 
 
 async def start_signal_engine():
-    task = asyncio.create_task(watch_and_signal_loop())
-    return task
+    return asyncio.create_task(watch_and_signal_loop())

@@ -2,13 +2,14 @@ import hashlib
 import hmac
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy import select
 
 from app.api.deps import CurrentUser, DbSession
+from app.core.redis import rate_limit_check
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -70,11 +71,33 @@ async def _send_verification_email(user: User) -> None:
     pass
 
 
+RESET_TOKEN_TTL = timedelta(hours=1)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def _enforce_rate_limit(request: Request, action: str, identifier: str = ""):
+    ip = _client_ip(request)
+    if not await rate_limit_check(f"{action}:{ip}:{identifier}", max_attempts=5, window_seconds=900):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many attempts. Try again in 15 minutes.",
+        )
+
+
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     request: UserRegisterRequest,
+    http_request: Request,
     db: DbSession,
 ):
+    await _enforce_rate_limit(http_request, "register")
+
     existing = await db.execute(select(User).where(User.email == request.email))
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -92,6 +115,18 @@ async def register(
     db.add(user)
     await db.flush()
 
+    # 7-day full trial auto-starts at registration: the first session must
+    # show live signals, not a paywall
+    from app.models.subscription import Subscription, SubscriptionPlan, SubscriptionStatus
+    db.add(Subscription(
+        user_id=user.id,
+        plan=SubscriptionPlan.TRADER,
+        status=SubscriptionStatus.TRIAL,
+        started_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+        trial_used=True,
+    ))
+
     user_id_str = str(user.id)
     access_token = create_access_token({"sub": user_id_str})
     refresh_token = create_refresh_token({"sub": user_id_str})
@@ -105,8 +140,11 @@ async def register(
 @router.post("/login", response_model=TokenResponse)
 async def login(
     request: UserLoginRequest,
+    http_request: Request,
     db: DbSession,
 ):
+    await _enforce_rate_limit(http_request, "login", request.email.lower())
+
     result = await db.execute(select(User).where(User.email == request.email))
     user = result.scalar_one_or_none()
 
@@ -243,8 +281,11 @@ async def verify_email(
 @router.post("/forgot-password")
 async def forgot_password(
     request: ForgotPasswordRequest,
+    http_request: Request,
     db: DbSession,
 ):
+    await _enforce_rate_limit(http_request, "forgot")
+
     result = await db.execute(select(User).where(User.email == request.email))
     user = result.scalar_one_or_none()
 
@@ -265,7 +306,12 @@ async def reset_password(
     )
     user = result.scalar_one_or_none()
 
-    if user is None:
+    token_expired = (
+        user is not None
+        and user.email_verification_sent_at is not None
+        and datetime.now(timezone.utc) - user.email_verification_sent_at > RESET_TOKEN_TTL
+    )
+    if user is None or token_expired:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Invalid or expired reset token",

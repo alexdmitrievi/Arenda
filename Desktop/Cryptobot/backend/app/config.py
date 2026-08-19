@@ -27,6 +27,9 @@ class Settings(BaseSettings):
 
     TELEGRAM_TOKEN: str = ""
     BOT_USERNAME: str = ""
+    # public channel/chat for signal showcase, e.g. "-1001234567890" or "@tbx_signals";
+    # the bot must be an admin of the channel
+    TELEGRAM_SIGNALS_CHANNEL_ID: str = ""
 
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
@@ -35,8 +38,12 @@ class Settings(BaseSettings):
 
     YOOKASSA_SHOP_ID: str = ""
     YOOKASSA_SECRET_KEY: str = ""
+    YOOKASSA_ENABLED: bool = False
 
     ENCRYPTION_KEY: str = ""
+
+    # extra high-impact macro events, JSON list: [{"name": "US CPI", "at": "2026-08-12T12:30:00+00:00"}]
+    MACRO_EVENTS_JSON: str = ""
 
     PORT: int = int(os.getenv("PORT", "8000"))
 

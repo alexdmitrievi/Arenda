@@ -12,13 +12,13 @@ from app.core.security import decrypt_api_key
 
 logger = logging.getLogger("tbx.trading.exchange")
 
-EXCHANGE_MAP = {
-    "binance": ccxt_async.binance,
-    "bybit": ccxt_async.bybit,
-    "okx": ccxt_async.okx,
-}
+SUPPORTED_EXCHANGES = ["binance", "bybit", "okx"]
 
-SUPPORTED_EXCHANGES = list(EXCHANGE_MAP.keys())
+
+def _exchange_class(name: str):
+    if not CCXT_AVAILABLE:
+        raise RuntimeError("ccxt is not installed — exchange connectivity is unavailable")
+    return getattr(ccxt_async, name)
 
 
 async def create_exchange_client(
@@ -29,7 +29,7 @@ async def create_exchange_client(
     testnet: bool = False,
 ) -> ccxt_async.Exchange:
     name = exchange_name.lower()
-    if name not in EXCHANGE_MAP:
+    if name not in SUPPORTED_EXCHANGES:
         raise ValueError(f"Unsupported exchange: {name}. Supported: {SUPPORTED_EXCHANGES}")
 
     config: dict[str, Any] = {
@@ -44,7 +44,7 @@ async def create_exchange_client(
     if testnet:
         config["testnet"] = True
 
-    exchange_class = EXCHANGE_MAP[name]
+    exchange_class = _exchange_class(name)
     exchange = exchange_class(config)
     await exchange.load_markets()
     logger.info("Exchange %s connected: %d markets", name, len(exchange.markets))

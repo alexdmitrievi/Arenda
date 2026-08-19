@@ -1,8 +1,9 @@
+from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -73,22 +74,28 @@ async def get_current_admin(current_user: CurrentUser) -> User:
 CurrentAdmin = Annotated[User, Depends(get_current_admin)]
 
 
+async def has_active_subscription(user: User, db: AsyncSession) -> bool:
+    """A referral grants access only after verification (referred_by is set
+    exclusively by the referral-verification flow, never by user input)."""
+    if user.referred_by:
+        return True
+
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(Subscription.id).where(
+            Subscription.user_id == user.id,
+            Subscription.status.in_([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL]),
+            or_(Subscription.expires_at.is_(None), Subscription.expires_at > now),
+        ).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def require_active_subscription(
     current_user: CurrentUser,
     db: DbSession,
 ) -> User:
-    if current_user.referred_by:
-        return current_user
-
-    result = await db.execute(
-        select(Subscription).where(
-            Subscription.user_id == current_user.id,
-            Subscription.status.in_([SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIAL]),
-        )
-    )
-    sub = result.scalar_one_or_none()
-
-    if sub:
+    if await has_active_subscription(current_user, db):
         return current_user
 
     raise HTTPException(

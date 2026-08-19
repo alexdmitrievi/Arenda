@@ -16,6 +16,7 @@ class TradeSide(StrEnum):
 
 
 class TradeStatus(StrEnum):
+    PENDING = "pending"  # DB row written, exchange order not yet confirmed
     OPEN = "open"
     CLOSED = "closed"
     CANCELLED = "cancelled"
@@ -50,6 +51,8 @@ class Trade(Base, UUIDMixin, TimestampMixin):
     size: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     pnl: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fee: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     status: Mapped[TradeStatus] = mapped_column(
         Enum(TradeStatus, name="trade_status"), default=TradeStatus.OPEN
     )

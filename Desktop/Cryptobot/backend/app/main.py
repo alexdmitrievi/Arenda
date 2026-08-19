@@ -21,12 +21,22 @@ logger = logging.getLogger("tbx")
 
 _collector_task = None
 _signal_task = None
+_scheduler_tasks: list = []
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _collector_task, _signal_task
+    global _collector_task, _signal_task, _scheduler_tasks
     logger.info("TBX Trade Terminal starting...")
+
+    from app.core.security import validate_crypto_config
+    if settings.DEBUG:
+        try:
+            validate_crypto_config()
+        except RuntimeError as e:
+            logger.warning("Crypto config (allowed in DEBUG only): %s", e)
+    else:
+        validate_crypto_config()
 
     await init_redis()
 
@@ -43,12 +53,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Market data collector not started: %s", e)
 
+    from app.services.scheduler import start_scheduler
+    _scheduler_tasks = start_scheduler()
+    logger.info("Background scheduler started (subscriptions, reconciliation)")
+
+    if settings.TELEGRAM_TOKEN:
+        from app.services.notifications.broadcaster import start_broadcaster
+        _scheduler_tasks.append(start_broadcaster())
+        logger.info("Signal broadcaster started")
+
     yield
 
     if _collector_task:
         _collector_task.cancel()
     if _signal_task:
         _signal_task.cancel()
+    for task in _scheduler_tasks:
+        task.cancel()
 
     if settings.TELEGRAM_TOKEN:
         await stop_bot()
