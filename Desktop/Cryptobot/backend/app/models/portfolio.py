@@ -7,7 +7,7 @@ from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, TimestampMixin, UUIDMixin
+from app.models.base import Base, TimestampMixin, UUIDMixin, enum_values
 
 
 class PortfolioType(StrEnum):
@@ -41,11 +41,11 @@ class Portfolio(Base, UUIDMixin, TimestampMixin):
 
     user_id: Mapped[UUIDType] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    type: Mapped[PortfolioType] = mapped_column(Enum(PortfolioType, name="portfolio_type"), default=PortfolioType.CUSTOM)
+    type: Mapped[PortfolioType] = mapped_column(Enum(PortfolioType, name="portfolio_type", values_callable=enum_values), default=PortfolioType.CUSTOM)
     allocation: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     rebalance_threshold_pct: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=Decimal("5.00"))
     rebalance_frequency: Mapped[RebalanceFrequency] = mapped_column(
-        Enum(RebalanceFrequency, name="rebalance_frequency"), default=RebalanceFrequency.MANUAL
+        Enum(RebalanceFrequency, name="rebalance_frequency", values_callable=enum_values), default=RebalanceFrequency.MANUAL
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -57,7 +57,7 @@ class DCAPlan(Base, UUIDMixin, TimestampMixin):
     portfolio_id: Mapped[UUIDType | None] = mapped_column(UUID(as_uuid=True), ForeignKey("portfolios.id"), nullable=True)
     asset: Mapped[str] = mapped_column(String(32), nullable=False)
     amount_per_period: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    frequency: Mapped[DCAFrequency] = mapped_column(Enum(DCAFrequency, name="dca_frequency"), default=DCAFrequency.WEEKLY)
+    frequency: Mapped[DCAFrequency] = mapped_column(Enum(DCAFrequency, name="dca_frequency", values_callable=enum_values), default=DCAFrequency.WEEKLY)
     atr_multiplier: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=Decimal("2.00"))
     active_steps: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     next_execution_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -73,7 +73,7 @@ class PropFirmChallenge(Base, UUIDMixin, TimestampMixin):
     rules: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     progress: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[ChallengeStatus] = mapped_column(
-        Enum(ChallengeStatus, name="challenge_status"), default=ChallengeStatus.ACTIVE
+        Enum(ChallengeStatus, name="challenge_status", values_callable=enum_values), default=ChallengeStatus.ACTIVE
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

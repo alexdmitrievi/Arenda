@@ -1,0 +1,83 @@
+version: "3.9"
+
+# Production overlay: frontend + nginx + certbot on top of the base stack.
+# Run together with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Secrets come from backend/.env (see deployment README):
+#   ENCRYPTION_KEY, SECRET_KEY, TELEGRAM_TOKEN, DATABASE_URL, REDIS_URL...
+
+services:
+  backend:
+    # base service overrides
+    ports: !reset []
+    expose:
+      - "8000"
+    # api.telegram.org resolves to IPv6-only from YC; the VM has no public
+    # IPv6 route. Pin the reachable IPv4 endpoint (ТСПУ-friendly).
+    extra_hosts:
+      - "api.telegram.org:149.154.167.220"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://tbx:${PG_PASSWORD}@postgres:5432/tbx
+      - DATABASE_URL_SYNC=postgresql://tbx:${PG_PASSWORD}@postgres:5432/tbx
+    volumes:
+      - backend_reports:/app/reports
+
+  postgres:
+    ports: !reset []
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+
+  redis:
+    ports: !reset []
+    expose:
+      - "6379"
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=https://tvh-ru.ru/api/v1
+    container_name: tbx-frontend
+    expose:
+      - "3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=https://tvh-ru.ru/api/v1
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: tbx-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8443:8443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - certbot_www:/var/www/certbot:ro
+      - certbot_conf:/etc/letsencrypt:ro
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+
+  certbot:
+    image: certbot/certbot
+    container_name: tbx-certbot
+    volumes:
+      - certbot_www:/var/www/certbot
+      - certbot_conf:/etc/letsencrypt
+    entrypoint: >
+      sh -c "certbot certonly --webroot -w /var/www/certbot
+      -d tvh-ru.ru -d www.tvh-ru.ru
+      --email admin@tvh-ru.ru --agree-tos --no-eff-email --keep-until-expiring"
+
+volumes:
+  backend_reports:
+  certbot_www:
+  certbot_conf:

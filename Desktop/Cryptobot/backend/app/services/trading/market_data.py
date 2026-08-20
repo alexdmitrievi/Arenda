@@ -62,6 +62,23 @@ async def set_latest_price(redis: aioredis.Redis, symbol: str, price: float):
     await redis.set(key, str(price), ex=60)
 
 
+async def set_quote_volume(redis: aioredis.Redis, symbol: str, quote_volume: float):
+    """24h quote (USDT) volume from the ticker stream — liquidity gate input."""
+    key = f"volume24h:{symbol}"
+    await redis.set(key, str(quote_volume), ex=3600)
+
+
+async def get_quote_volume(redis: aioredis.Redis, symbol: str) -> float | None:
+    key = f"volume24h:{symbol}"
+    data = await redis.get(key)
+    if data:
+        try:
+            return float(data)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 async def get_market_snapshot(redis: aioredis.Redis, symbols: list[str]) -> dict[str, float | None]:
     keys = [f"price:{s}" for s in symbols]
     prices = await redis.mget(keys)

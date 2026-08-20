@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -9,11 +9,23 @@ from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 
 from app.api.deps import ActiveSubscriber, CurrentUser, DbSession, has_active_subscription
+from app.config import settings
 from app.core.database import async_session_factory
 from app.core.redis import get_redis
-from app.core.security import decode_token, decrypt_api_key
+from app.core.security import decode_token
 from app.models.trade import Signal, Trade, TradeSide, TradeStatus
 from app.models.user import User
+from app.services.trading.credentials import get_bybit_credentials, user_risk_pct
+from app.services.trading.bybit import make_client, perp_symbol, prepare_symbol
+from app.services.trading.execution import (
+    StopLossFailure,
+    compute_position_size,
+    ensure_stop_attached,
+    position_metrics,
+    validate_geometry,
+)
+from app.services.trading.killswitch import is_trading_halted
+from app.services.trading.sync import record_trade_close
 from app.services.trading.market_data import get_latest_price
 
 logger = logging.getLogger("tbx.api.signals")
@@ -200,24 +212,17 @@ class ExecuteRequest(BaseModel):
 
 
 def _decrypted_bybit_keys(user) -> tuple[str, str]:
-    user_keys = user.exchange_keys_encrypted or {}
-    bybit_keys = user_keys.get("bybit", {})
-    api_key = bybit_keys.get("api_key")
-    secret = bybit_keys.get("secret")
-    if not api_key or not secret:
+    credentials = get_bybit_credentials(user)
+    if not credentials:
         raise HTTPException(
             status_code=400,
             detail="Bybit API keys not configured. Add them in settings.",
         )
-    return decrypt_api_key(api_key), decrypt_api_key(secret)
+    return credentials
 
 
 def _user_risk_pct(user) -> float:
-    bybit_keys = (user.exchange_keys_encrypted or {}).get("bybit", {})
-    try:
-        return float(bybit_keys.get("risk_per_trade_pct", 2.0))
-    except (TypeError, ValueError):
-        return 2.0
+    return user_risk_pct(user)
 
 
 @router.post("/signals/{signal_id}/execute")
@@ -229,6 +234,12 @@ async def execute_signal_endpoint(
     request: ExecuteRequest | None = None,
 ):
     request = request or ExecuteRequest()
+
+    if await is_trading_halted():
+        raise HTTPException(
+            status_code=503,
+            detail="Trading is halted by the operator kill switch. Try again later.",
+        )
 
     result = await db.execute(select(Signal).where(Signal.id == signal_id))
     signal = result.scalar_one_or_none()
@@ -255,52 +266,76 @@ async def execute_signal_endpoint(
     tp_price = float(tp_list[0]) if tp_list else None
     side = "buy" if str(signal.direction) == "buy" or signal.direction == TradeSide.BUY else "sell"
 
+    # product mandate: at least 3:1 reward-to-risk, checked before touching the exchange
+    try:
+        validate_geometry(entry_price, stop_loss_price, tp_price)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     if request.paper:
         return await _execute_paper(db, current_user, signal, side, entry_price, stop_loss_price, tp_price)
 
     if side == "sell":
         raise HTTPException(
             status_code=400,
-            detail="Short trades are not supported on spot yet. Use paper mode to track this signal.",
+            detail="SELL execution is disabled by the owner decision (BUY-only). "
+            "Use paper mode to track this signal.",
         )
 
     api_key, secret = _decrypted_bybit_keys(current_user)
     risk_pct = _user_risk_pct(current_user)
 
-    import ccxt.async_support as ccxt_async
-
-    exchange = ccxt_async.bybit({
-        "apiKey": api_key,
-        "secret": secret,
-        "enableRateLimit": True,
-    })
+    exchange = make_client(api_key, secret)
 
     try:
         await exchange.load_markets()
+
+        # USDT-M perpetual futures: 'BTC/USDT' -> 'BTC/USDT:USDT'
+        symbol = perp_symbol(signal.symbol)
 
         balance_data = await exchange.fetch_balance()
         usdt_balance = float(balance_data.get("USDT", {}).get("free", 0))
 
         await _check_portfolio_risk(db, current_user.id, usdt_balance)
 
-        risk_amount = usdt_balance * (risk_pct / 100)
-        position_size_base = round(risk_amount / stop_distance, 6)
+        # product mandate: 2% of deposit risked per trade, sized from the
+        # stop zone — leverage never enters the formula
+        try:
+            position_size_base = compute_position_size(
+                usdt_balance, risk_pct, entry_price, stop_loss_price
+            )
+            metrics = position_metrics(
+                entry_price, stop_loss_price, tp_price,
+                usdt_balance, risk_pct, leverage=settings.BYBIT_LEVERAGE,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if position_size_base <= 0:
             raise HTTPException(status_code=400, detail="Position size too small")
 
+        # platform margin/leverage policy before any order touches the book
+        await prepare_symbol(exchange, symbol)
+        order_amount = float(exchange.amount_to_precision(symbol, position_size_base))
+        if order_amount <= 0:
+            raise HTTPException(status_code=400, detail="Position size rounds to zero on this market")
+
         # 1) persist intent BEFORE touching the exchange — a crash after the
-        #    order leaves a PENDING row the reconciliation loop will flag,
-        #    never a position that the system does not know about
+        #    order leaves a PENDING row the reconciliation loop will resolve
+        #    via client_order_id, never a position the system loses track of
+        client_order_id = str(uuid4())
         trade = Trade(
             user_id=current_user.id,
             exchange="bybit",
-            symbol=signal.symbol,
+            symbol=symbol,
             side=TradeSide.BUY,
             strategy_id=signal.strategy_id,
             signal_id=signal.id,
             entry_price=Decimal(str(entry_price)),
-            size=Decimal(str(position_size_base)),
+            size=Decimal(str(order_amount)),
             status=TradeStatus.PENDING,
+            client_order_id=client_order_id,
+            stop_loss=Decimal(str(stop_loss_price)),
+            take_profit=Decimal(str(tp_price)) if tp_price else None,
         )
         db.add(trade)
         await db.commit()
@@ -308,13 +343,13 @@ async def execute_signal_endpoint(
 
         # 2) one atomic order: SL/TP attached at creation, not as a
         #    second request that can silently fail
-        order_params: dict = {"stopLoss": stop_loss_price}
+        order_params: dict = {"stopLoss": stop_loss_price, "clientOrderId": client_order_id}
         if tp_price:
             order_params["takeProfit"] = tp_price
 
         try:
             order = await exchange.create_order(
-                signal.symbol, "market", side, position_size_base, None, order_params
+                symbol, "market", side, order_amount, None, order_params
             )
         except Exception as e:
             trade.status = TradeStatus.CANCELLED
@@ -330,19 +365,42 @@ async def execute_signal_endpoint(
         trade.entry_price = Decimal(str(fill_price))
         if fee_info.get("cost") is not None:
             trade.fee = Decimal(str(fee_info["cost"]))
+
+        # 4) invariant: no position may exist without a stop-loss. The stop
+        #    was requested in the same order; now verify it actually exists
+        #    on the exchange, placing it separately if the exchange ignored
+        #    the parameter. If it cannot be attached — close immediately.
+        try:
+            protective = await ensure_stop_attached(
+                exchange, symbol, side, order_amount,
+                stop_loss_price, tp_price,
+            )
+        except StopLossFailure as e:
+            logger.critical(
+                "Trade %s (%s) has no stop-loss and one cannot be attached: %s — closing position",
+                trade.id, symbol, e,
+            )
+            await _emergency_close_trade(exchange, trade, db)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Stop-loss could not be attached, position was closed: {str(e)[:200]}",
+            )
+        trade.stop_order_id = protective["stop_order_id"]
+        trade.tp_order_id = protective["tp_order_id"]
+
         signal.executed = True
         await db.commit()
 
         return {
             "status": "executed",
             "trade_id": str(trade.id),
-            "symbol": signal.symbol,
+            "symbol": symbol,
             "direction": side,
             "entry_price": float(fill_price),
             "stop_loss": stop_loss_price,
             "take_profit": tp_price,
-            "position_size": position_size_base,
-            "risk_amount": round(risk_amount, 2),
+            "position_size": order_amount,
+            "risk": metrics,
             "paper": False,
         }
     except HTTPException:
@@ -368,6 +426,10 @@ async def _execute_paper(db, user, signal, side: str, entry_price: float,
     risk_amount = paper_balance * 0.02
     stop_distance = abs(fill_price - stop_loss_price) or fill_price * 0.01
     size = round(risk_amount / stop_distance, 6)
+    metrics = position_metrics(
+        fill_price, stop_loss_price, tp_price,
+        paper_balance, 2.0, leverage=settings.BYBIT_LEVERAGE,
+    )
 
     trade = Trade(
         user_id=user.id,
@@ -379,6 +441,8 @@ async def _execute_paper(db, user, signal, side: str, entry_price: float,
         entry_price=Decimal(str(fill_price)),
         size=Decimal(str(size)),
         status=TradeStatus.OPEN,
+        stop_loss=Decimal(str(stop_loss_price)),
+        take_profit=Decimal(str(tp_price)) if tp_price else None,
     )
     db.add(trade)
     await db.commit()
@@ -393,7 +457,7 @@ async def _execute_paper(db, user, signal, side: str, entry_price: float,
         "stop_loss": stop_loss_price,
         "take_profit": tp_price,
         "position_size": size,
-        "risk_amount": round(risk_amount, 2),
+        "risk": metrics,
         "paper": True,
     }
 
@@ -466,21 +530,35 @@ async def get_trade_history(
 
 
 def _record_close(trade: Trade, exit_price: float, fee_cost: float | None = None):
-    trade.status = TradeStatus.CLOSED
-    trade.closed_at = datetime.now(timezone.utc)
-    trade.exit_price = Decimal(str(exit_price))
+    record_trade_close(trade, exit_price, fee_cost)
 
-    entry = float(trade.entry_price)
-    size = float(trade.size)
-    direction = 1 if str(trade.side) == "buy" or trade.side == TradeSide.BUY else -1
-    pnl = (exit_price - entry) * size * direction
-    if fee_cost:
-        pnl -= fee_cost
-        trade.fee = (trade.fee or Decimal("0")) + Decimal(str(fee_cost))
-    trade.pnl = Decimal(str(round(pnl, 2)))
-    notional = entry * size
-    if notional > 0:
-        trade.pnl_pct = Decimal(str(round(pnl / notional * 100, 2)))
+
+async def _emergency_close_trade(exchange, trade: Trade, db) -> bool:
+    """Market-close a perp position whose stop-loss could not be attached.
+
+    Returns True when the exchange confirms the close and the DB was updated.
+    """
+    close_side = "sell" if str(trade.side) == "buy" else "buy"
+    try:
+        order = await exchange.create_order(
+            trade.symbol, "market", close_side, float(trade.size),
+            None, {"reduceOnly": True},
+        )
+        exit_price = float(order.get("average") or order.get("price") or 0)
+        if exit_price <= 0:
+            ticker = await exchange.fetch_ticker(trade.symbol)
+            exit_price = float(ticker.get("last") or trade.entry_price)
+        fee_info = order.get("fee") or {}
+        record_trade_close(trade, exit_price, fee_info.get("cost"))
+        await db.commit()
+        logger.critical("Emergency close of trade %s done at %.4f", trade.id, exit_price)
+        return True
+    except Exception as e:
+        logger.critical(
+            "Emergency close of trade %s FAILED — position may exist without a stop: %s",
+            trade.id, e,
+        )
+        return False
 
 
 @router.post("/positions/{trade_id}/close")
@@ -515,20 +593,16 @@ async def close_position(
         }
 
     api_key, secret = _decrypted_bybit_keys(current_user)
-
-    import ccxt.async_support as ccxt_async
-
-    exchange = ccxt_async.bybit({
-        "apiKey": api_key,
-        "secret": secret,
-        "enableRateLimit": True,
-    })
+    exchange = make_client(api_key, secret)
 
     try:
         await exchange.load_markets()
 
         close_side = "sell" if str(trade.side) == "buy" else "buy"
-        order = await exchange.create_order(trade.symbol, "market", close_side, float(trade.size))
+        order = await exchange.create_order(
+            trade.symbol, "market", close_side, float(trade.size),
+            None, {"reduceOnly": True},
+        )
 
         exit_price = float(order.get("average") or order.get("price") or 0)
         if exit_price <= 0:
@@ -559,6 +633,12 @@ async def close_position(
 
 
 def _signal_to_dict(s: Signal) -> dict:
+    from app.services.trading.execution import stop_zone_and_rr
+
+    zone, rr = stop_zone_and_rr(
+        float(s.entry), float(s.stop_loss),
+        float(s.take_profit[0]) if s.take_profit else None,
+    )
     return {
         "id": str(s.id),
         "symbol": s.symbol,
@@ -567,6 +647,8 @@ def _signal_to_dict(s: Signal) -> dict:
         "stop_loss": float(s.stop_loss),
         "take_profit": s.take_profit if isinstance(s.take_profit, list) else [],
         "confidence": s.confidence,
+        "stop_zone_pct": zone,
+        "rr": rr,
         "executed": s.executed,
         "metadata": s.metadata_ or {},
         "created_at": s.created_at.isoformat() if s.created_at else None,

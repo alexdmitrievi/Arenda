@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, TimestampMixin, UUIDMixin
+from app.models.base import Base, TimestampMixin, UUIDMixin, enum_values
 
 
 class UserRole(StrEnum):
@@ -31,7 +31,7 @@ class User(Base, UUIDMixin, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     role: Mapped[UserRole] = mapped_column(
-        Enum(UserRole, name="user_role"), default=UserRole.USER
+        Enum(UserRole, name="user_role", values_callable=enum_values), default=UserRole.USER
     )
     # MutableDict: in-place mutations must mark the column dirty, otherwise
     # adding a second exchange key is silently lost at flush time

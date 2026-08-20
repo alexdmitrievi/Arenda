@@ -1,11 +1,20 @@
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.api.deps import CurrentAdmin, DbSession
 from app.models.user import User, UserRole
 from app.schemas.user import AdminStatsResponse, AdminUserUpdate, UserListResponse, UserProfileResponse
+from app.services.trading.bybit import make_client
+from app.services.trading.credentials import get_bybit_credentials
+from app.services.trading.killswitch import (
+    clear_trading_halt,
+    close_all_positions,
+    get_trading_halt_info,
+    set_trading_halt,
+)
 
 router = APIRouter()
 
@@ -111,3 +120,59 @@ async def get_stats(
         email_verified_users=verified.scalar() or 0,
         users_with_exchange_keys=with_keys.scalar() or 0,
     )
+
+
+class KillSwitchRequest(BaseModel):
+    reason: str = "Manual operator kill switch"
+
+
+@router.get("/killswitch")
+async def killswitch_status(_admin: CurrentAdmin):
+    return {"halted": await get_trading_halt_info()}
+
+
+@router.post("/killswitch")
+async def activate_killswitch(
+    db: DbSession,
+    _admin: CurrentAdmin,
+    payload: KillSwitchRequest | None = None,
+):
+    """Global emergency stop: halt new signals/executions and market-close
+    every user's USDT-M perpetual positions."""
+    payload = payload or KillSwitchRequest()
+    halt_info = await set_trading_halt(payload.reason)
+
+    result = await db.execute(select(User).where(User.exchange_keys_encrypted.is_not(None)))
+    users = result.scalars().all()
+
+    closed_positions = []
+    exchange_errors = []
+    for user in users:
+        credentials = get_bybit_credentials(user)
+        if not credentials:
+            continue
+        exchange = make_client(credentials[0], credentials[1])
+        try:
+            await exchange.load_markets()
+            closed_positions.extend(await close_all_positions(exchange))
+        except Exception as e:
+            exchange_errors.append({"user_id": str(user.id), "error": str(e)[:200]})
+        finally:
+            try:
+                await exchange.close()
+            except Exception:
+                pass
+
+    return {
+        "status": "halted",
+        "reason": payload.reason,
+        "halted_at": halt_info.get("at"),
+        "closed_positions": closed_positions,
+        "exchange_errors": exchange_errors,
+    }
+
+
+@router.delete("/killswitch")
+async def deactivate_killswitch(_admin: CurrentAdmin):
+    await clear_trading_halt()
+    return {"status": "resumed"}

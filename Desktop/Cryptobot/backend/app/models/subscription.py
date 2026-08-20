@@ -7,7 +7,7 @@ from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric, String, Tex
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, TimestampMixin, UUIDMixin
+from app.models.base import Base, TimestampMixin, UUIDMixin, enum_values
 
 
 class SubscriptionPlan(StrEnum):
@@ -98,11 +98,11 @@ class Subscription(Base, UUIDMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
     )
     plan: Mapped[SubscriptionPlan] = mapped_column(
-        Enum(SubscriptionPlan, name="subscription_plan"),
+        Enum(SubscriptionPlan, name="subscription_plan", values_callable=enum_values),
         default=SubscriptionPlan.DEMO,
     )
     status: Mapped[SubscriptionStatus] = mapped_column(
-        Enum(SubscriptionStatus, name="subscription_status"),
+        Enum(SubscriptionStatus, name="subscription_status", values_callable=enum_values),
         default=SubscriptionStatus.PENDING,
     )
     started_at: Mapped[datetime | None] = mapped_column(
@@ -137,11 +137,11 @@ class Payment(Base, UUIDMixin, TimestampMixin):
     currency: Mapped[str] = mapped_column(String(3), default="RUB")
     vat_rate: Mapped[int] = mapped_column(default=4)
     status: Mapped[PaymentStatus] = mapped_column(
-        Enum(PaymentStatus, name="payment_status"), default=PaymentStatus.PENDING
+        Enum(PaymentStatus, name="payment_status", values_callable=enum_values), default=PaymentStatus.PENDING
     )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     plan: Mapped[SubscriptionPlan | None] = mapped_column(
-        Enum(SubscriptionPlan, name="subscription_plan"), nullable=True
+        Enum(SubscriptionPlan, name="subscription_plan", values_callable=enum_values), nullable=True
     )
     metadata_: Mapped[dict | None] = mapped_column(
         "metadata_json", JSONB, nullable=True

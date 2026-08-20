@@ -42,6 +42,15 @@ class Settings(BaseSettings):
 
     ENCRYPTION_KEY: str = ""
 
+    # Bybit execution (USDT-M perpetual futures)
+    BYBIT_TESTNET: bool = False
+    BYBIT_LEVERAGE: int = 1
+    BYBIT_MARGIN_MODE: str = "cross"  # "cross" | "isolated"
+
+    # liquidity gate: publish signals only for pairs with >= this 24h quote
+    # volume (USDT) on Binance (owner decision 2026-08-20)
+    MIN_DAILY_VOLUME_USD: int = 300_000_000
+
     # extra high-impact macro events, JSON list: [{"name": "US CPI", "at": "2026-08-12T12:30:00+00:00"}]
     MACRO_EVENTS_JSON: str = ""
 

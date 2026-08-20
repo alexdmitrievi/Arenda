@@ -213,6 +213,52 @@ class TestSignalGeometry:
                 assert all(tp > signal.entry for tp in signal.take_profit)
 
 
+class TestVolumeProfile:
+
+    def _flat_with_volume_at(self, n: int = 120, anchor: float = 100.0) -> pd.DataFrame:
+        rows = []
+        for i in range(n):
+            vol = 5000.0 if i % 2 == 0 else 100.0
+            rows.append({"timestamp": i, "open": anchor - 0.2, "high": anchor + 0.3,
+                         "low": anchor - 0.3, "close": anchor, "volume": vol})
+        return pd.DataFrame(rows)
+
+    def test_poc_near_high_volume_level(self):
+        df = self._flat_with_volume_at()
+        profile = StructuralAnalysis.detect_volume_profile(df)
+        assert profile is not None
+        assert abs(profile["poc"] - 100.0) < 2.0
+        assert profile["val"] <= profile["poc"] <= profile["vah"]
+
+    def test_returns_none_on_thin_data(self):
+        df = make_ohlcv([100.0 + i * 0.1 for i in range(10)])
+        df["volume"] = 0.0
+        assert StructuralAnalysis.detect_volume_profile(df) is None
+
+    def test_volume_zone_boosts_buy_confidence(self):
+        gen = SignalGenerator()
+        fib = FibonacciCalculator.retracement(110, 100)
+        highs = [SwingPoint(20, 130.0, True)]
+        lows = [SwingPoint(10, 95.0, False)]
+        args = (100.0, "BULLISH", fib, [], [], [], highs, lows, [], {"regime": "TREND"}, "BULLISH")
+        vol_zone = {"poc": 100.0, "val": 99.0, "vah": 101.0}
+        base, _ = gen._evaluate_buy(*args)
+        boosted, reasons = gen._evaluate_buy(*args, vol_zone)
+        assert boosted == base + 8
+        assert any("объёма" in r for r in reasons)
+
+    def test_volume_zone_outside_no_boost(self):
+        gen = SignalGenerator()
+        fib = FibonacciCalculator.retracement(110, 100)
+        highs = [SwingPoint(20, 130.0, True)]
+        lows = [SwingPoint(10, 95.0, False)]
+        args = (100.0, "BULLISH", fib, [], [], [], highs, lows, [], {"regime": "TREND"}, "BULLISH")
+        vol_zone = {"poc": 80.0, "val": 79.0, "vah": 81.0}
+        base, _ = gen._evaluate_buy(*args)
+        boosted, _ = gen._evaluate_buy(*args, vol_zone)
+        assert boosted == base
+
+
 class TestRegimeDetection:
 
     def test_trend_regime_on_strong_move(self):

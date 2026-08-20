@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import Any
 
@@ -97,6 +99,9 @@ async def create_stop_loss_order(
     params: dict | None = None,
 ) -> dict:
     p = params or {}
+    # Bybit spot uses triggerPrice for conditional market orders;
+    # unified futures param kept for derivatives clients
+    p["triggerPrice"] = stop_price
     p["stopLossPrice"] = stop_price
     return await exchange.create_order(symbol, "market", side, amount, None, p)
 
@@ -110,8 +115,41 @@ async def create_take_profit_order(
     params: dict | None = None,
 ) -> dict:
     p = params or {}
+    p["triggerPrice"] = tp_price
     p["takeProfitPrice"] = tp_price
     return await exchange.create_order(symbol, "market", side, amount, None, p)
+
+
+async def fetch_my_trades(
+    exchange: ccxt_async.Exchange,
+    symbol: str,
+    since_ms: int | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    return await exchange.fetch_my_trades(symbol, since=since_ms, limit=limit)
+
+
+async def find_order_by_client_id(
+    exchange: ccxt_async.Exchange,
+    client_order_id: str,
+    symbol: str,
+) -> dict | None:
+    """Locate an order by its client id, checking open then closed orders.
+
+    ccxt has no portable fetch-by-client-id API, so we scan both books and
+    match on orderLinkId (Bybit) / clientOrderId (unified name).
+    """
+    for fetcher in (exchange.fetch_open_orders, exchange.fetch_closed_orders):
+        try:
+            orders = await fetcher(symbol)
+        except Exception:
+            continue
+        for order in orders:
+            info = order.get("info") or {}
+            if info.get("orderLinkId") == client_order_id or \
+               info.get("clientOrderId") == client_order_id:
+                return order
+    return None
 
 
 async def cancel_order(

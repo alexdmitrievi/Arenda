@@ -247,6 +247,65 @@ class StructuralAnalysis:
         return {"regime": regime, "slope_atr": round(slope_atr, 2), "atr_rank": round(atr_rank, 2)}
 
     @staticmethod
+    def detect_volume_profile(df: pd.DataFrame, bins: int = 25,
+                              va_pct: float = 0.7,
+                              lookback: int = 120) -> dict | None:
+        """Simple volume profile over recent bars: POC + value area.
+
+        Returns {"poc": float, "vah": float, "val": float} or None when the
+        data is too thin. The value area covers va_pct (70%) of the volume
+        around the POC — the trader's "плотка"/зона по объёму analogue.
+        """
+        if df.empty or "volume" not in df.columns:
+            return None
+        window = df.iloc[-lookback:]
+        high = float(window["high"].max())
+        low = float(window["low"].min())
+        if high <= low:
+            return None
+        step = (high - low) / bins
+        if step <= 0:
+            return None
+        level = low
+        profile: dict[float, float] = {}
+        for _ in range(bins):
+            profile[round(level, 12)] = 0.0
+            level += step
+        for _, row in window.iterrows():
+            vol = float(row["volume"]) if row["volume"] and row["volume"] > 0 else 0.0
+            if vol <= 0:
+                continue
+            keys = sorted(profile)
+            start = int((float(row["low"]) - low) // step)
+            end = int((float(row["high"]) - low) // step)
+            start = max(0, min(bins - 1, start))
+            end = max(0, min(bins - 1, end))
+            if start > end:
+                start, end = end, start
+            span = max(1, end - start + 1)
+            share = vol / span
+            for i in range(start, end + 1):
+                profile[keys[i]] += share
+        if not profile or sum(profile.values()) <= 0:
+            return None
+        poc = max(profile, key=profile.get)
+        total_vol = sum(profile.values())
+        target_vol = total_vol * va_pct
+        ordered = sorted(profile.items(), key=lambda kv: abs(kv[0] - poc))
+        acc = 0.0
+        va_levels = []
+        for price, vol in ordered:
+            acc += vol
+            va_levels.append(price)
+            if acc >= target_vol:
+                break
+        return {
+            "poc": round(poc, 8),
+            "vah": round(max(va_levels), 8),
+            "val": round(min(va_levels), 8),
+        }
+
+    @staticmethod
     def detect_liquidity_sweeps(df: pd.DataFrame, liquidity: list[dict],
                                 lookback: int = SWEEP_LOOKBACK) -> list[dict]:
         """A sweep = a wick pierces a liquidity pool but the candle closes back.
@@ -357,6 +416,7 @@ class SignalGenerator:
         sweeps: list[dict] | None = None,
         regime: dict | None = None,
         htf_trend: str = "NEUTRAL",
+        vol_zone: dict | None = None,
     ) -> SignalResult:
         sweeps = sweeps or []
         regime = regime or {"regime": "RANGE"}
@@ -389,10 +449,12 @@ class SignalGenerator:
         buy_confidence, buy_reasons = self._evaluate_buy(
             current_price, trend, fib, fvgs, obs, liquidity,
             recent_swing_highs, recent_swing_lows, sweeps, regime, htf_trend,
+            vol_zone,
         )
         sell_confidence, sell_reasons = self._evaluate_sell(
             current_price, trend, fib, fvgs, obs, liquidity,
             recent_swing_highs, recent_swing_lows, sweeps, regime, htf_trend,
+            vol_zone,
         )
 
         base_meta = {"trend": trend, "regime": regime, "htf_trend": htf_trend}
@@ -446,9 +508,14 @@ class SignalGenerator:
         fvgs: list[FVGZone], obs: list[dict], liq: list[dict],
         highs: list[SwingPoint], lows: list[SwingPoint],
         sweeps: list[dict], regime: dict, htf_trend: str,
+        vol_zone: dict | None = None,
     ) -> tuple[int, list[str]]:
         confidence = 50
         reasons: list[str] = []
+
+        if vol_zone and vol_zone.get("val") <= price <= vol_zone.get("vah"):
+            confidence += 8
+            reasons.append("Цена в зоне объёма (Volume Profile VA/POC)")
 
         if trend == "BULLISH":
             confidence += 15
@@ -513,9 +580,14 @@ class SignalGenerator:
         fvgs: list[FVGZone], obs: list[dict], liq: list[dict],
         highs: list[SwingPoint], lows: list[SwingPoint],
         sweeps: list[dict], regime: dict, htf_trend: str,
+        vol_zone: dict | None = None,
     ) -> tuple[int, list[str]]:
         confidence = 50
         reasons: list[str] = []
+
+        if vol_zone and vol_zone.get("val") <= price <= vol_zone.get("vah"):
+            confidence += 8
+            reasons.append("Цена в зоне объёма (Volume Profile VA/POC)")
 
         if trend == "BEARISH":
             confidence += 15
@@ -628,10 +700,12 @@ class SMCStrategy(AbstractStrategy):
         sweeps = StructuralAnalysis.detect_liquidity_sweeps(df, liquidity)
         regime = StructuralAnalysis.detect_regime(df)
         htf_trend = self._htf_trend(htf_df)
+        vol_zone = StructuralAnalysis.detect_volume_profile(df)
 
         signal = self.generator.generate(
             df, swings, bos_events, fvgs, obs, liquidity, symbol,
             sweeps=sweeps, regime=regime, htf_trend=htf_trend,
+            vol_zone=vol_zone,
         )
 
         logger.info(

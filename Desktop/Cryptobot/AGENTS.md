@@ -56,20 +56,28 @@ infrastructure/docker-compose.yml          backend + postgres + redis
 
 ## How the algorithm works
 
-1. Collector holds a Binance WebSocket, receives 1h candles for 17 liquid pairs.
+1. Collector holds Binance WebSockets, receives 1h and 5m candles for 17
+   liquid pairs (liquidity gate: 24h quote volume ≥ $300M on Binance).
 2. On each closed hourly candle the engine analyses the last 500 candles.
 3. Detects swing points, breaks of structure (BOS/CHoCH), fair value gaps (FVG),
-   order blocks with displacement, liquidity sweeps; classifies the regime
-   (TREND/RANGE/CHOP); computes a 4h higher-timeframe bias.
+   order blocks with displacement, liquidity sweeps, volume profile (POC/VA);
+   classifies the regime (TREND/RANGE/CHOP); computes a 4h higher-timeframe bias.
 4. Scores confidence 0–100. A signal requires confidence ≥ 50 **and** at least
-   3:1 reward-to-risk from market structure.
-5. Gates before publishing: macro blackout (±60 min around FOMC/NFP); BTC guide
-   dog (bearish structure on **both** 4h and 1d suppresses every long); CHOP veto.
-6. Signal → database → Redis pub/sub → Telegram + SSE to the dashboard.
-7. The user confirms manually. **The bot never trades on its own.**
-8. Execution: size from 2% account risk; order placed atomically with stop-loss
-   and take-profit attached; portfolio limits — max 5 concurrent positions and a
-   5% daily realised-loss circuit breaker.
+   2:1 reward-to-risk from market structure.
+5. The 1h signal is then **armed**: it goes public only after the 5m chart
+   confirms it (5m BOS/sweep-reclaim within 6 hours); the entry is refined to
+   the 5m structure; refined RR below 2:1 → the signal is dropped.
+6. Gates before publishing: macro blackout (±60 min around FOMC/NFP); BTC guide
+   dog (bearish structure on **both** 4h and 1d suppresses every long); CHOP veto;
+   liquidity gate (≥ $300M daily volume); kill switch.
+7. DeepSeek (Variant A) writes a human-readable explanation of each published
+   signal from the same data — it never proposes levels (product principle).
+8. Signal → database → Redis pub/sub → Telegram + SSE to the dashboard.
+9. The user confirms manually. **The bot never trades on its own.**
+10. Execution: USDT-M perpetual futures on Bybit (BUY-only for now; shorts are
+    paper-only), Cross margin, leverage 1x (config), size from 2% account risk;
+    order placed atomically with stop-loss and take-profit attached; portfolio
+    limits — max 5 concurrent positions and a 5% daily realised-loss circuit breaker.
 
 ## Already implemented — do not redo
 
@@ -93,7 +101,8 @@ infrastructure/docker-compose.yml          backend + postgres + redis
 4. Cover every change with tests. The existing suite must stay green:
    `cd backend && python -m pytest tests/ -q`
 5. Do not remove existing protections: `ENCRYPTION_KEY` fail-fast, the 5-position
-   cap, the 5% daily loss limit, the macro blackout, the BTC gate, the 3:1 RR rule.
+   cap, the 5% daily loss limit, the macro blackout, the BTC gate, the 2:1 RR rule,
+   the ≥ $300M liquidity gate.
 6. No neural networks or external AI in the signal engine. AI is only for
    generating human-readable explanations.
 7. Every schema change gets its own alembic migration; never edit an existing one.

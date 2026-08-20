@@ -28,13 +28,23 @@ def format_signal_message(payload: dict) -> str:
     icon = "🟢" if direction == "BUY" else "🔴"
     tps = payload.get("take_profit") or []
     tp_line = " / ".join(f"{tp:g}" for tp in tps) if tps else "—"
-    return (
+    lines = [
         f"{icon} Сигнал: {payload.get('symbol')} — {direction} "
-        f"(уверенность {payload.get('confidence')}%)\n"
-        f"Вход: {payload.get('entry'):g}\n"
-        f"Стоп: {payload.get('stop_loss'):g}\n"
-        f"Цели: {tp_line}"
-    )
+        f"(уверенность {payload.get('confidence')}%)",
+        f"Вход: {payload.get('entry'):g}",
+        f"Стоп: {payload.get('stop_loss'):g}",
+        f"Цели: {tp_line}",
+    ]
+    if payload.get("stop_zone_pct"):
+        lines.append(f"Стоп-зона: {payload['stop_zone_pct']}%")
+    if payload.get("rr"):
+        lines.append(f"RR: 1:{payload['rr']}")
+    analysis = (payload.get("analysis") or "").strip()
+    if analysis:
+        lines.append("")
+        lines.append("📊 Аналитика ИИ:")
+        lines.append(analysis[:1200])
+    return "\n".join(lines)
 
 
 async def _eligible_telegram_ids() -> list[int]:

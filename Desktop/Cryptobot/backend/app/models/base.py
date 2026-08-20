@@ -10,6 +10,11 @@ class Base(DeclarativeBase):
     pass
 
 
+def enum_values(enum_cls) -> list[str]:
+    """Bind enum VALUES (not member names) — the DB labels are lowercase values."""
+    return [member.value for member in enum_cls]
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 

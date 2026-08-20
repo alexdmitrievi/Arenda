@@ -7,7 +7,7 @@ from sqlalchemy import DateTime, Enum, ForeignKey, Numeric, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, TimestampMixin, UUIDMixin
+from app.models.base import Base, TimestampMixin, UUIDMixin, enum_values
 
 
 class TradeSide(StrEnum):
@@ -38,7 +38,7 @@ class Trade(Base, UUIDMixin, TimestampMixin):
     exchange: Mapped[str] = mapped_column(String(32), nullable=False)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     side: Mapped[TradeSide] = mapped_column(
-        Enum(TradeSide, name="trade_side"), nullable=False
+        Enum(TradeSide, name="trade_side", values_callable=enum_values), nullable=False
     )
     strategy_id: Mapped[str | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("strategies.id"), nullable=True
@@ -52,9 +52,14 @@ class Trade(Base, UUIDMixin, TimestampMixin):
     pnl: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    stop_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tp_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    take_profit: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     fee: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     status: Mapped[TradeStatus] = mapped_column(
-        Enum(TradeStatus, name="trade_status"), default=TradeStatus.OPEN
+        Enum(TradeStatus, name="trade_status", values_callable=enum_values), default=TradeStatus.OPEN
     )
     closed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -69,7 +74,7 @@ class Position(Base, UUIDMixin, TimestampMixin):
     )
     exchange: Mapped[str] = mapped_column(String(32), nullable=False)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
-    side: Mapped[TradeSide] = mapped_column(Enum(TradeSide, name="trade_side"), nullable=False)
+    side: Mapped[TradeSide] = mapped_column(Enum(TradeSide, name="trade_side", values_callable=enum_values), nullable=False)
     size: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     avg_entry: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     current_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
@@ -85,7 +90,7 @@ class Signal(Base, UUIDMixin, TimestampMixin):
     )
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     direction: Mapped[TradeSide] = mapped_column(
-        Enum(TradeSide, name="trade_side"), nullable=False
+        Enum(TradeSide, name="trade_side", values_callable=enum_values), nullable=False
     )
     entry: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     stop_loss: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
@@ -100,7 +105,7 @@ class Strategy(Base, UUIDMixin, TimestampMixin):
 
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     type: Mapped[StrategyType] = mapped_column(
-        Enum(StrategyType, name="strategy_type"), nullable=False
+        Enum(StrategyType, name="strategy_type", values_callable=enum_values), nullable=False
     )
     params: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     is_active: Mapped[bool] = mapped_column(default=False)

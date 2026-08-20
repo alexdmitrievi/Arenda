@@ -111,7 +111,10 @@ export interface Signal {
   stop_loss: number;
   take_profit: number[];
   confidence: number;
+  stop_zone_pct?: number;
+  rr?: number;
   executed: boolean;
+  metadata?: { ai_analysis?: string };
   created_at: string;
 }
 
@@ -186,12 +189,19 @@ export async function register(
   return res;
 }
 
-export async function fetchSignals(hours = 24): Promise<SignalsResponse> {
-  return api<SignalsResponse>(`/trading/signals?hours=${hours}`);
+export async function fetchSignals(hours = 24, direction?: string): Promise<SignalsResponse> {
+  const dir = direction ? `&direction=${direction}` : "";
+  return api<SignalsResponse>(`/trading/signals?hours=${hours}${dir}`);
 }
 
-export async function executeSignal(signalId: string): Promise<{ status: string; trade_id: string }> {
-  return api(`/trading/signals/${signalId}/execute`, { method: "POST" });
+export async function executeSignal(
+  signalId: string,
+  paper = true
+): Promise<{ status: string; trade_id: string }> {
+  return api(`/trading/signals/${signalId}/execute`, {
+    method: "POST",
+    body: JSON.stringify({ paper }),
+  });
 }
 
 export async function fetchPositions(): Promise<PositionsResponse> {

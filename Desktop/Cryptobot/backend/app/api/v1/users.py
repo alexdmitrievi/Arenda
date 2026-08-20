@@ -75,10 +75,50 @@ async def set_exchange_keys(
     if data.risk_per_trade_pct is not None:
         key_data["risk_per_trade_pct"] = data.risk_per_trade_pct
 
+    if data.exchange.lower() == "bybit":
+        await _verify_bybit_key_permissions(data.api_key, data.secret, data.passphrase, key_data)
+
     current_keys[data.exchange.lower()] = key_data
     current_user.exchange_keys_encrypted = current_keys
 
     return {"message": f"Exchange keys for {data.exchange} saved", "exchange": data.exchange}
+
+
+async def _verify_bybit_key_permissions(api_key: str, secret: str, passphrase: str | None, key_data: dict) -> None:
+    """Fail-closed permission gate: keys carrying withdrawal/transfer rights
+    are rejected, and unverifiable keys are not saved at all."""
+    from app.services.trading.bybit import make_client
+    from app.services.trading.key_permissions import (
+        check_permissions,
+        fetch_bybit_key_permissions,
+    )
+
+    exchange = make_client(api_key, secret, passphrase)
+    try:
+        await exchange.load_markets()
+        groups = await fetch_bybit_key_permissions(exchange)
+    except Exception as e:
+        logger.error("Bybit key permission verification failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not verify Bybit key permissions — keys were not saved.",
+        )
+    finally:
+        try:
+            await exchange.close()
+        except Exception:
+            pass
+
+    problems = check_permissions(groups)
+    if problems:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bybit key rejected: " + "; ".join(problems),
+        )
+
+    key_data["permissions_verified"] = True
+    key_data["permissions_verified_at"] = datetime.now(timezone.utc).isoformat()
+    key_data["permissions"] = groups
 
 
 @router.get("/me/exchange-keys", response_model=list[ExchangeKeyResponse])
